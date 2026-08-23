@@ -26,7 +26,7 @@ jobs:
       - name: Install dependencies
         run: mix deps.get
       - name: Verify tag matches package version
-        run: test "${GITHUB_REF_NAME#v}" = "$(mix run --no-compile -e 'IO.write(Mix.Project.config()[:version])')"
+        run: test "${GITHUB_REF_NAME#v}" = "$(mix run --no-start --no-compile -e 'IO.write(Mix.Project.config()[:version])')"
       - name: Run checks
         run: make check
       - name: Set up Featurevisor example 1 project
