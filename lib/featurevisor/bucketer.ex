@@ -47,6 +47,8 @@ defmodule Featurevisor.Bucketer do
   def bucket_string(nil), do: ""
   def bucket_string(value) when is_integer(value), do: Integer.to_string(value)
   def bucket_string(value) when is_float(value), do: javascript_number(value)
+  def bucket_string(value) when is_list(value), do: Enum.map_join(value, ",", &bucket_string/1)
+  def bucket_string(value) when is_map(value) and not is_struct(value), do: "[object Object]"
   def bucket_string(value), do: to_string(value)
 
   def javascript_number(value) do
@@ -61,8 +63,15 @@ defmodule Featurevisor.Bucketer do
     value
     |> :erlang.float_to_binary([:short])
     |> expand_exponent()
-    |> String.trim_trailing("0")
-    |> String.trim_trailing(".")
+    |> trim_fraction()
+  end
+
+  defp trim_fraction(value) do
+    if String.contains?(value, ".") do
+      value |> String.trim_trailing("0") |> String.trim_trailing(".")
+    else
+      value
+    end
   end
 
   defp scientific_number(value) do

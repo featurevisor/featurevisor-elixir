@@ -27,6 +27,10 @@ defmodule Featurevisor.Child do
 
   @doc "Merges or replaces child context."
   def set_context(child, context, replace \\ false) do
+    if Process.alive?(child.agent), do: set_live_context(child, context, replace), else: :ok
+  end
+
+  defp set_live_context(child, context, replace) do
     details =
       Agent.get_and_update(child.agent, fn state ->
         value = if replace, do: context, else: Map.merge(state.context, context)
@@ -39,12 +43,16 @@ defmodule Featurevisor.Child do
 
   @doc "Returns the effective child context."
   def get_context(child, context \\ %{}) do
-    stored = Agent.get(child.agent, & &1.context)
+    stored = if Process.alive?(child.agent), do: Agent.get(child.agent, & &1.context), else: %{}
     Featurevisor.get_context(child.parent) |> Map.merge(stored) |> Map.merge(context)
   end
 
   @doc "Merges or replaces child sticky values."
   def set_sticky(child, sticky, replace \\ false) do
+    if Process.alive?(child.agent), do: set_live_sticky(child, sticky, replace), else: :ok
+  end
+
+  defp set_live_sticky(child, sticky, replace) do
     details =
       Agent.get_and_update(child.agent, fn state ->
         value = if replace, do: sticky, else: Map.merge(state.sticky, sticky)
@@ -59,6 +67,24 @@ defmodule Featurevisor.Child do
 
   @doc "Subscribes to a child or delegated parent event."
   def on(child, event, callback) when event in [:context_set, :sticky_set] do
+    if Process.alive?(child.agent) do
+      subscribe_to_local_event(child, event, callback)
+    else
+      once(fn -> :ok end)
+    end
+  end
+
+  def on(child, event, callback) do
+    if Process.alive?(child.agent) do
+      unsubscribe = Featurevisor.on(child.parent, event, callback)
+      Agent.update(child.agent, fn state -> %{state | unsubs: state.unsubs ++ [unsubscribe]} end)
+      once(fn -> unsubscribe.() end)
+    else
+      once(fn -> :ok end)
+    end
+  end
+
+  defp subscribe_to_local_event(child, event, callback) do
     id = make_ref()
 
     Agent.update(child.agent, fn state ->
@@ -87,12 +113,6 @@ defmodule Featurevisor.Child do
     end)
   end
 
-  def on(child, event, callback) do
-    unsubscribe = Featurevisor.on(child.parent, event, callback)
-    Agent.update(child.agent, fn state -> %{state | unsubs: state.unsubs ++ [unsubscribe]} end)
-    once(fn -> unsubscribe.() end)
-  end
-
   @doc "Evaluates a flag through the parent instance."
   @spec evaluate_flag(t(), String.t(), map(), map()) :: Evaluation.t()
   def evaluate_flag(child, key, context \\ %{}, options \\ %{}),
@@ -107,11 +127,6 @@ defmodule Featurevisor.Child do
   @doc "Returns whether a feature is enabled."
   def enabled?(child, key, context \\ %{}, options \\ %{}),
     do: evaluate_flag(child, key, context, options).enabled == true
-
-  @doc "Alias matching other Featurevisor SDK terminology."
-  # credo:disable-for-next-line Credo.Check.Readability.PredicateFunctionNames
-  def is_enabled(child, key, context \\ %{}, options \\ %{}),
-    do: enabled?(child, key, context, options)
 
   @doc "Evaluates a variation through the parent instance."
   def evaluate_variation(child, key, context \\ %{}, options \\ %{}),
@@ -155,6 +170,44 @@ defmodule Featurevisor.Child do
         child_options(child, options)
       )
 
+  @doc "Returns a boolean variable after runtime type checking."
+  def get_variable_boolean(child, key, variable, context \\ %{}, options \\ %{}),
+    do: typed_variable(child, :get_variable_boolean, key, variable, context, options)
+
+  @doc "Returns a string variable after runtime type checking."
+  def get_variable_string(child, key, variable, context \\ %{}, options \\ %{}),
+    do: typed_variable(child, :get_variable_string, key, variable, context, options)
+
+  @doc "Returns an integer variable after runtime type checking."
+  def get_variable_integer(child, key, variable, context \\ %{}, options \\ %{}),
+    do: typed_variable(child, :get_variable_integer, key, variable, context, options)
+
+  @doc "Returns a finite numeric variable after runtime type checking."
+  def get_variable_double(child, key, variable, context \\ %{}, options \\ %{}),
+    do: typed_variable(child, :get_variable_double, key, variable, context, options)
+
+  @doc "Returns a list variable after runtime type checking."
+  def get_variable_array(child, key, variable, context \\ %{}, options \\ %{}),
+    do: typed_variable(child, :get_variable_array, key, variable, context, options)
+
+  @doc "Returns a map variable after runtime type checking."
+  def get_variable_object(child, key, variable, context \\ %{}, options \\ %{}),
+    do: typed_variable(child, :get_variable_object, key, variable, context, options)
+
+  @doc "Returns a decoded JSON variable."
+  def get_variable_json(child, key, variable, context \\ %{}, options \\ %{}),
+    do: typed_variable(child, :get_variable_json, key, variable, context, options)
+
+  @doc "Evaluates all or selected features through the parent instance."
+  def get_all_evaluations(child, context \\ %{}, feature_keys \\ [], options \\ %{}) do
+    Featurevisor.get_all_evaluations(
+      child.parent,
+      get_context(child, context),
+      feature_keys,
+      child_options(child, options)
+    )
+  end
+
   @doc "Closes child listeners and delegated subscriptions."
   def close(child) do
     if Process.alive?(child.agent) do
@@ -168,7 +221,21 @@ defmodule Featurevisor.Child do
 
   defp child_options(child, options) do
     options = if is_list(options), do: Map.new(options), else: options
-    Map.put(options, :__child_sticky, Agent.get(child.agent, & &1.sticky))
+
+    sticky =
+      if Process.alive?(child.agent), do: Agent.get(child.agent, & &1.sticky), else: %{}
+
+    Map.put(options, :__child_sticky, sticky)
+  end
+
+  defp typed_variable(child, function, key, variable, context, options) do
+    apply(Featurevisor, function, [
+      child.parent,
+      key,
+      variable,
+      get_context(child, context),
+      child_options(child, options)
+    ])
   end
 
   defp trigger(child, event, details),

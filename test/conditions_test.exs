@@ -138,4 +138,11 @@ defmodule Featurevisor.ConditionsTest do
     assert Conditions.all_segments?("everyone", %{}, segments, cache, report)
     refute Conditions.all_segments?("missing", %{}, segments, cache, report)
   end
+
+  test "formats native lists and maps in bucket keys like JavaScript" do
+    assert Featurevisor.Bucketer.bucket_string([1, 2]) == "1,2"
+    assert Featurevisor.Bucketer.bucket_string(["a", "b"]) == "a,b"
+    assert Featurevisor.Bucketer.bucket_string([1, [2, 3], nil]) == "1,2,3,"
+    assert Featurevisor.Bucketer.bucket_string(%{"a" => 1}) == "[object Object]"
+  end
 end

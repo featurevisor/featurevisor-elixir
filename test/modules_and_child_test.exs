@@ -64,7 +64,18 @@ defmodule Featurevisor.ModulesAndChildTest do
            }
 
     assert Featurevisor.Child.enabled?(child, "flag")
+    assert Featurevisor.Child.get_variable_string(child, "experiment", "title") == "Control"
+    assert Featurevisor.Child.get_variable_integer(child, "experiment", "count") == 0
+
+    assert Featurevisor.Child.get_variable_json(child, "experiment", "config") == %{
+             "enabled" => true
+           }
+
+    assert Featurevisor.Child.get_all_evaluations(child, %{}, ["flag"])["flag"].enabled
     Featurevisor.Child.close(child)
+    assert Featurevisor.Child.set_context(child, %{"country" => "fr"}) == :ok
+    assert Featurevisor.Child.set_sticky(child, %{}) == :ok
+    refute Featurevisor.Child.enabled?(child, "missing")
     Featurevisor.Child.close(child)
     Featurevisor.close(f)
   end

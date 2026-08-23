@@ -25,7 +25,13 @@ defmodule Featurevisor do
   @spec create_featurevisor(options() | keyword()) :: t()
   def create_featurevisor(options \\ %{}) do
     options = normalize_options(options)
-    {:ok, pid} = Server.start(options)
+
+    pid =
+      case Server.start(options) do
+        {:ok, pid} -> pid
+        {:error, reason} -> raise "Could not start Featurevisor instance: #{inspect(reason)}"
+      end
+
     instance = %__MODULE__{pid: pid, table: Server.table(pid)}
 
     Enum.each(Map.get(options, :modules, []), &add_module(instance, &1))
@@ -44,6 +50,10 @@ defmodule Featurevisor do
   @doc "Merges or replaces the stored datafile."
   @spec set_datafile(t(), map() | String.t(), boolean()) :: :ok | {:error, term()}
   def set_datafile(instance, input, replace \\ false) do
+    if open?(instance), do: set_live_datafile(instance, input, replace), else: :ok
+  end
+
+  defp set_live_datafile(instance, input, replace) do
     with {:ok, datafile} <- Server.parse_datafile(input),
          true <- Server.valid_datafile?(datafile) do
       details =
@@ -87,6 +97,10 @@ defmodule Featurevisor do
 
   @doc "Merges or replaces the stored context."
   def set_context(instance, context, replace \\ false) when is_map(context) do
+    if open?(instance), do: set_live_context(instance, context, replace), else: :ok
+  end
+
+  defp set_live_context(instance, context, replace) do
     resolved =
       Server.update(instance.pid, fn snapshot ->
         value = if replace, do: context, else: Map.merge(snapshot.context, context)
@@ -111,6 +125,10 @@ defmodule Featurevisor do
 
   @doc "Merges or replaces sticky evaluations."
   def set_sticky(instance, sticky, replace \\ false) when is_map(sticky) do
+    if open?(instance), do: set_live_sticky(instance, sticky, replace), else: :ok
+  end
+
+  defp set_live_sticky(instance, sticky, replace) do
     {_resolved, keys} =
       Server.update(instance.pid, fn snapshot ->
         previous = snapshot.sticky || %{}
@@ -133,7 +151,11 @@ defmodule Featurevisor do
 
   @doc "Changes the diagnostic threshold."
   def set_log_level(instance, level) when level in [:fatal, :error, :warn, :info, :debug] do
-    Server.update(instance.pid, fn snapshot -> {:ok, %{snapshot | log_level: level}} end)
+    if open?(instance) do
+      Server.update(instance.pid, fn snapshot -> {:ok, %{snapshot | log_level: level}} end)
+    else
+      :ok
+    end
   end
 
   @doc "Returns the current datafile revision."
@@ -170,11 +192,6 @@ defmodule Featurevisor do
   @doc "Returns whether a feature is enabled."
   def enabled?(instance, feature_key, context \\ %{}, options \\ %{}),
     do: evaluate_flag(instance, feature_key, context, options).enabled == true
-
-  @doc "Alias matching other Featurevisor SDK terminology."
-  # credo:disable-for-next-line Credo.Check.Readability.PredicateFunctionNames
-  def is_enabled(instance, feature_key, context \\ %{}, options \\ %{}),
-    do: enabled?(instance, feature_key, context, options)
 
   @doc "Evaluates a variation and returns details."
   def evaluate_variation(instance, feature_key, context \\ %{}, options \\ %{}),
@@ -272,7 +289,7 @@ defmodule Featurevisor do
     end)
   end
 
-  @doc "Returns whether a segment matches context."
+  @doc false
   def segment_matches?(instance, segment_key, context \\ %{}) do
     snap = snapshot(instance)
 
@@ -287,6 +304,10 @@ defmodule Featurevisor do
 
   @doc "Registers an SDK module. Returns an idempotent removal function or nil."
   def add_module(instance, %Module{} = original) do
+    if open?(instance), do: add_live_module(instance, original), else: nil
+  end
+
+  defp add_live_module(instance, original) do
     module = Server.module_id(original)
 
     duplicate =
@@ -351,7 +372,7 @@ defmodule Featurevisor do
 
   @doc "Removes every module with the supplied name."
   def remove_module(instance, name) do
-    if Process.alive?(instance.pid), do: remove_live_module(instance, name), else: :ok
+    if open?(instance), do: remove_live_module(instance, name), else: :ok
   end
 
   defp remove_live_module(instance, name) do
@@ -375,6 +396,14 @@ defmodule Featurevisor do
   def on(instance, event, callback)
       when event in [:datafile_set, :context_set, :sticky_set, :error] and
              is_function(callback, 1) do
+    if open?(instance) do
+      subscribe_to_event(instance, event, callback)
+    else
+      once(fn -> :ok end)
+    end
+  end
+
+  defp subscribe_to_event(instance, event, callback) do
     id = make_ref()
 
     Server.update(instance.pid, fn state ->
@@ -409,10 +438,10 @@ defmodule Featurevisor do
 
   @doc "Closes modules, subscriptions, listeners, caches, and the instance owner."
   def close(instance) do
-    if Process.alive?(instance.pid) do
+    if open?(instance) do
       modules = Server.close(instance.pid)
       Enum.each(modules, &close_module(instance, &1))
-      GenServer.stop(instance.pid, :normal)
+      if Process.alive?(instance.pid), do: GenServer.stop(instance.pid, :normal)
     end
 
     :ok
@@ -451,6 +480,7 @@ defmodule Featurevisor do
   defp typed(_, _), do: nil
 
   defp snapshot(instance), do: Server.snapshot(instance.table)
+  defp open?(instance), do: Process.alive?(instance.pid) and not snapshot(instance).closed
   defp normalize_options(options) when is_list(options), do: Map.new(options)
   defp normalize_options(options) when is_map(options), do: options
 

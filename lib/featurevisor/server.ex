@@ -11,6 +11,20 @@ defmodule Featurevisor.Server do
     "features" => %{}
   }
 
+  @closed_snapshot %{
+    datafile: @empty_datafile,
+    context: %{},
+    sticky: nil,
+    log_level: :fatal,
+    on_diagnostic: nil,
+    modules: [],
+    pending_modules: [],
+    subscriptions: [],
+    listeners: %{},
+    regex_cache: nil,
+    closed: true
+  }
+
   def start(options) do
     GenServer.start(__MODULE__, options)
   end
@@ -74,8 +88,10 @@ defmodule Featurevisor.Server do
   def snapshot(table) do
     case :ets.lookup(table, :snapshot) do
       [{:snapshot, snapshot}] -> snapshot
-      [] -> raise ArgumentError, "Featurevisor instance is closed"
+      [] -> @closed_snapshot
     end
+  rescue
+    ArgumentError -> @closed_snapshot
   end
 
   def parse_datafile(datafile) when is_binary(datafile), do: Jason.decode(datafile)

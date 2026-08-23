@@ -43,9 +43,11 @@ jobs:
           ./featurevisor test --projectDirectoryPath=./example-1 --target=all --target=checkout --onlyFailures
       - name: Verify package contents
         run: |
-          mix hex.publish --dry-run
+          mix hex.publish --dry-run --yes
           mix hex.build
           tar -tf featurevisor-*.tar | grep '^contents.tar.gz$'
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
       - name: Publish to Hex.pm
         run: mix hex.publish --yes
         env:

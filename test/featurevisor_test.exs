@@ -131,4 +131,34 @@ defmodule FeaturevisorTest do
     assert Featurevisor.get_variable_array(f, "experiment", "count") == nil
     assert Featurevisor.get_variable_object(f, "experiment", "count") == nil
   end
+
+  test "closed instances no-op mutations and return empty evaluations" do
+    f =
+      Featurevisor.create_featurevisor(%{
+        datafile: Featurevisor.TestFixtures.datafile(),
+        log_level: :fatal
+      })
+
+    Featurevisor.close(f)
+    refute Process.alive?(f.pid)
+    assert :ets.info(f.table) == :undefined
+
+    assert Featurevisor.set_datafile(f, Featurevisor.TestFixtures.datafile(), true) == :ok
+    assert Featurevisor.set_context(f, %{"country" => "nl"}) == :ok
+    assert Featurevisor.set_sticky(f, %{"flag" => %{"enabled" => true}}) == :ok
+    assert Featurevisor.set_log_level(f, :debug) == :ok
+    assert Featurevisor.remove_module(f, "missing") == :ok
+    assert Featurevisor.add_module(f, %Module{name: "late"}) == nil
+
+    unsubscribe = Featurevisor.on(f, :context_set, fn _ -> flunk("closed listener ran") end)
+    assert unsubscribe.() == :ok
+    assert unsubscribe.() == :ok
+
+    refute Featurevisor.enabled?(f, "flag")
+    assert Featurevisor.get_variation(f, "experiment") == nil
+    assert Featurevisor.get_variable(f, "experiment", "title") == nil
+    assert Featurevisor.get_feature_keys(f) == []
+    assert Featurevisor.get_revision(f) == "unknown"
+    assert Featurevisor.get_schema_version(f) == "2"
+  end
 end

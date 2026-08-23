@@ -40,18 +40,22 @@ defmodule Featurevisor.CLI.AssessDistribution do
               end
             )
 
-          IO.puts("\nDistribution assessment")
+          IO.puts("\nAssess Featurevisor distribution")
           IO.puts("Feature: #{options.feature}")
+          IO.puts("Environment: #{options.environment || false}")
           if target, do: IO.puts("Target: #{target}")
-          IO.puts("Evaluations: #{options.n}")
-          IO.puts("Enabled: #{counts.enabled}")
-          IO.puts("Disabled: #{counts.disabled}")
+          IO.puts("Iterations: #{options.n}")
+          IO.puts("\nFlag evaluations")
+          print_count("enabled", counts.enabled, options.n)
+          print_count("disabled", counts.disabled, options.n)
+
+          IO.puts("\nVariation evaluations")
 
           Enum.each(counts.variations, fn {variation, count} ->
-            IO.puts("Variation #{variation}: #{count}")
+            print_count(variation, count, options.n)
           end)
 
-          IO.puts("Unassigned: #{counts.unassigned}")
+          print_count("unassigned", counts.unassigned, options.n)
           Featurevisor.close(f)
           {:cont, :ok}
 
@@ -59,6 +63,11 @@ defmodule Featurevisor.CLI.AssessDistribution do
           {:halt, error}
       end
     end)
+  end
+
+  defp print_count(label, count, total) do
+    percentage = :erlang.float_to_binary(count / total * 100, decimals: 2)
+    IO.puts("#{label}: #{count} (#{percentage}%)")
   end
 
   defp deterministic_uuid(index, key) do

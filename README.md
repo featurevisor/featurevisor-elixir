@@ -92,6 +92,8 @@ datafile =
 f = Featurevisor.create_featurevisor(%{datafile: datafile})
 ```
 
+Create one long lived instance for your application and share it between processes. Evaluation reads immutable ETS snapshots and does not queue through the instance process. The convenience constructor is not linked to the calling process, so the owner must call `Featurevisor.close/1` during application shutdown.
+
 You may pass the JSON string directly:
 
 ```elixir
@@ -162,7 +164,7 @@ if Featurevisor.enabled?(f, "my_feature", %{"userId" => "123"}) do
 end
 ```
 
-`Featurevisor.is_enabled/4` is also available for familiarity with other Featurevisor SDKs.
+The idiomatic Elixir `enabled?/4` function corresponds to `isEnabled` in the JavaScript SDK and similarly named methods in other Featurevisor SDKs.
 
 ## Getting variation
 
@@ -378,6 +380,8 @@ child = Featurevisor.spawn(
 Featurevisor.Child.enabled?(child, "checkout", %{"userId" => "user-456"})
 Featurevisor.Child.get_variation(child, "checkout")
 Featurevisor.Child.get_variable(child, "checkout", "title")
+Featurevisor.Child.get_variable_string(child, "checkout", "title")
+Featurevisor.Child.get_all_evaluations(child)
 
 Featurevisor.Child.close(child)
 ```
@@ -468,6 +472,8 @@ make test-example-1
 
 The integration target executes all expanded `example-1` assertions, including Target datafiles, through the Elixir evaluator.
 
+`make check` remains the fast package gate. The separate `make test-example-1` target requires the sibling Featurevisor monorepo, so checks and publishing workflows run that integration explicitly after the package gate.
+
 ## Publishing
 
 Before tagging a release:
@@ -478,6 +484,8 @@ mix hex.publish --dry-run
 ```
 
 The release workflow verifies the tag, package contents, documentation, and `example-1` integration before publishing to Hex.pm.
+
+The published Hex package intentionally includes runtime source, `mix.exs`, the README, and the licence. Tests and the conformance fixture remain repository verification assets and are not shipped to consumers.
 
 ## License
 
