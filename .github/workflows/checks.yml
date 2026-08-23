@@ -1,0 +1,78 @@
+name: Checks
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sdk:
+    name: Elixir ${{ matrix.elixir }} and OTP ${{ matrix.otp }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - elixir: "1.15.8"
+            otp: "26.2"
+          - elixir: "1.20.3"
+            otp: "29.0"
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: erlef/setup-beam@v1.24.1
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+      - name: Install dependencies
+        run: mix deps.get
+      - name: Compile without warnings
+        run: mix compile --warnings-as-errors
+      - name: Test
+        run: mix test
+      - name: Format, static analysis, documentation, and package
+        if: matrix.elixir == '1.20.3'
+        run: |
+          mix format --check-formatted
+          mix credo --strict
+          mix dialyzer
+          mix docs --warnings-as-errors
+          mix hex.build
+
+  example:
+    name: Featurevisor example 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: erlef/setup-beam@v1.24.1
+        with:
+          elixir-version: "1.20.3"
+          otp-version: "29.0"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install dependencies
+        run: mix deps.get
+      - name: Set up Featurevisor example 1 project
+        run: |
+          mkdir example-1
+          cd example-1
+          npx --yes @featurevisor/cli@3 init --example=1
+          npm install
+          npx featurevisor build
+          npx featurevisor test --onlyFailures
+      - name: Run project tests through Elixir SDK
+        run: |
+          mix escript.build
+          ./featurevisor test --projectDirectoryPath=./example-1 --target=all --target=checkout --onlyFailures

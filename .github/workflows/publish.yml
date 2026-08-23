@@ -1,0 +1,52 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: erlef/setup-beam@v1.24.1
+        with:
+          elixir-version: "1.20.3"
+          otp-version: "29.0"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install dependencies
+        run: mix deps.get
+      - name: Verify tag matches package version
+        run: test "${GITHUB_REF_NAME#v}" = "$(mix run --no-compile -e 'IO.write(Mix.Project.config()[:version])')"
+      - name: Run checks
+        run: make check
+      - name: Set up Featurevisor example 1 project
+        run: |
+          mkdir example-1
+          cd example-1
+          npx --yes @featurevisor/cli@3 init --example=1
+          npm install
+          npx featurevisor build
+          npx featurevisor test --onlyFailures
+      - name: Run project tests through Elixir SDK
+        run: |
+          mix escript.build
+          ./featurevisor test --projectDirectoryPath=./example-1 --target=all --target=checkout --onlyFailures
+      - name: Verify package contents
+        run: |
+          mix hex.publish --dry-run
+          mix hex.build
+          tar -tf featurevisor-*.tar | grep '^contents.tar.gz$'
+      - name: Publish to Hex.pm
+        run: mix hex.publish --yes
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
