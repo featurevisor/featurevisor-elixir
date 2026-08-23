@@ -1,6 +1,6 @@
 # Featurevisor SDK for Elixir <!-- omit in toc -->
 
-This is the official Featurevisor SDK for Elixir. It evaluates feature flags, variations, and variables in Elixir applications using Featurevisor schema version 2 datafiles.
+This is the official [Featurevisor](https://featurevisor.com) SDK for Elixir. It evaluates feature flags, variations, and variables in Elixir applications using Featurevisor schema version 2 datafiles.
 
 The SDK supports concurrent evaluations, structured diagnostics, lifecycle modules, child instances, and the Featurevisor project test runner.
 
@@ -517,4 +517,4 @@ The published Hex package intentionally includes runtime source, `mix.exs`, the 
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT © [Fahad Heylaal](https://fahad19.com)
