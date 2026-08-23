@@ -9,6 +9,7 @@ The SDK supports concurrent evaluations, structured diagnostics, lifecycle modul
 - [Installation](#installation)
 - [Public API](#public-api)
 - [Initialization](#initialization)
+- [Supervision](#supervision)
 - [Evaluation types](#evaluation-types)
 - [Context](#context)
   - [Setting initial context](#setting-initial-context)
@@ -69,6 +70,7 @@ Create instances with `Featurevisor.create_featurevisor/1`. The returned `Featur
 Most applications use:
 
 - `Featurevisor.create_featurevisor/1`
+- `Featurevisor.start_link/1` and `Featurevisor.instance/1` for supervision
 - `Featurevisor.enabled?/2`
 - `Featurevisor.get_variation/2`
 - `Featurevisor.get_variable/3`
@@ -92,7 +94,7 @@ datafile =
 f = Featurevisor.create_featurevisor(%{datafile: datafile})
 ```
 
-Create one long lived instance for your application and share it between processes. Evaluation reads immutable ETS snapshots and does not queue through the instance process. The convenience constructor is not linked to the calling process, so the owner must call `Featurevisor.close/1` during application shutdown.
+Create one long lived instance for your application and share it between processes. Evaluation reads immutable ETS snapshots and does not queue through the instance process. The convenience constructor is not linked to the calling process, so its owner must call `Featurevisor.close/1` during application shutdown.
 
 You may pass the JSON string directly:
 
@@ -101,6 +103,30 @@ f = Featurevisor.create_featurevisor(%{datafile: File.read!("datafile.json")})
 ```
 
 Invalid datafiles do not replace the active datafile. They report an `invalid_datafile` diagnostic with the stable message `Could not parse datafile`.
+
+## Supervision
+
+Use a supervised instance in long running OTP applications:
+
+```elixir
+children = [
+  {Featurevisor,
+   name: MyApp.Featurevisor,
+   datafile: datafile,
+   log_level: :warn}
+]
+
+Supervisor.start_link(children, strategy: :one_for_one, name: MyApp.Supervisor)
+```
+
+Resolve its Featurevisor handle wherever it is needed:
+
+```elixir
+f = Featurevisor.instance(MyApp.Featurevisor)
+Featurevisor.enabled?(f, "my_feature", %{"userId" => "123"})
+```
+
+The supervisor owns shutdown and restart. Module close callbacks run during supervised shutdown. Resolve the handle again after a restart because the new owner process creates new ETS tables.
 
 ## Evaluation types
 
@@ -397,6 +423,8 @@ Featurevisor.close(f)
 ```
 
 Close invokes module close callbacks and removes listeners, diagnostic subscriptions, and caches. Calling close more than once is safe.
+
+Do not call `close/1` directly for a supervised instance. Stop its supervisor or remove its child instead. A closed handle evaluates against an empty datafile, so flags return `false`, variations and variables return `nil`, and the revision returns `"unknown"`.
 
 ## CLI usage
 

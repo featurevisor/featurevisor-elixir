@@ -18,7 +18,8 @@ defmodule Featurevisor do
           optional(:log_level) => Diagnostic.level(),
           optional(:on_diagnostic) => (Diagnostic.t() -> any()),
           optional(:sticky) => map(),
-          optional(:modules) => [Module.t()]
+          optional(:modules) => [Module.t()],
+          optional(:name) => GenServer.name()
         }
 
   @doc "Creates an isolated Featurevisor instance."
@@ -32,19 +33,49 @@ defmodule Featurevisor do
         {:error, reason} -> raise "Could not start Featurevisor instance: #{inspect(reason)}"
       end
 
-    instance = %__MODULE__{pid: pid, table: Server.table(pid)}
+    initialize_instance(pid, options)
+  end
 
-    Enum.each(Map.get(options, :modules, []), &add_module(instance, &1))
-    if Map.has_key?(options, :datafile), do: set_datafile(instance, options.datafile, true)
+  @doc "Starts a supervised Featurevisor owner process."
+  @spec start_link(options() | keyword()) :: GenServer.on_start()
+  def start_link(options \\ %{}) do
+    options = normalize_options(options)
 
-    report(instance, %{
-      level: :info,
-      code: "sdk_initialized",
-      message: "SDK initialized",
-      details: %{}
-    })
+    case Server.start_link(options) do
+      {:ok, pid} ->
+        initialize_instance(pid, options)
+        {:ok, pid}
 
-    instance
+      error ->
+        error
+    end
+  end
+
+  @doc "Returns a Featurevisor handle for a running owner process or registered name."
+  @spec instance(GenServer.server()) :: t()
+  def instance(server) do
+    pid = GenServer.whereis(server)
+
+    if is_pid(pid) do
+      %__MODULE__{pid: pid, table: Server.table(server)}
+    else
+      raise ArgumentError, "Featurevisor instance is not running"
+    end
+  catch
+    :exit, _reason -> raise ArgumentError, "Featurevisor instance is not running"
+  end
+
+  @doc false
+  def child_spec(options) do
+    options = normalize_options(options)
+
+    %{
+      id: Map.get(options, :name, __MODULE__),
+      start: {__MODULE__, :start_link, [options]},
+      type: :worker,
+      restart: :permanent,
+      shutdown: 5_000
+    }
   end
 
   @doc "Merges or replaces the stored datafile."
@@ -483,6 +514,22 @@ defmodule Featurevisor do
   defp open?(instance), do: Process.alive?(instance.pid) and not snapshot(instance).closed
   defp normalize_options(options) when is_list(options), do: Map.new(options)
   defp normalize_options(options) when is_map(options), do: options
+
+  defp initialize_instance(pid, options) do
+    instance = %__MODULE__{pid: pid, table: Server.table(pid)}
+
+    Enum.each(Map.get(options, :modules, []), &add_module(instance, &1))
+    if Map.has_key?(options, :datafile), do: set_datafile(instance, options.datafile, true)
+
+    report(instance, %{
+      level: :info,
+      code: "sdk_initialized",
+      message: "SDK initialized",
+      details: %{}
+    })
+
+    instance
+  end
 
   defp reporter(instance), do: fn diagnostic -> report(instance, diagnostic) end
 

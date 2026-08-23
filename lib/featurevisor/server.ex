@@ -29,8 +29,16 @@ defmodule Featurevisor.Server do
     GenServer.start(__MODULE__, options)
   end
 
+  def start_link(options) do
+    case Map.get(options, :name) do
+      nil -> GenServer.start_link(__MODULE__, options)
+      name -> GenServer.start_link(__MODULE__, options, name: name)
+    end
+  end
+
   @impl true
   def init(options) do
+    Process.flag(:trap_exit, true)
     table = :ets.new(__MODULE__, [:set, :public, read_concurrency: true, write_concurrency: true])
 
     regex_cache =
@@ -79,6 +87,39 @@ defmodule Featurevisor.Server do
     )
 
     {:reply, modules, state}
+  end
+
+  @impl true
+  def terminate(_reason, state) do
+    case :ets.lookup(state.table, :snapshot) do
+      [{:snapshot, snapshot}] ->
+        :ets.insert(
+          state.table,
+          {:snapshot, %{snapshot | closed: true, modules: [], subscriptions: [], listeners: %{}}}
+        )
+
+        task =
+          Task.async(fn ->
+            Enum.each(snapshot.modules, fn module ->
+              if module.close do
+                try do
+                  module.close.()
+                rescue
+                  _error -> :ok
+                catch
+                  _kind, _reason -> :ok
+                end
+              end
+            end)
+          end)
+
+        Task.await(task, :infinity)
+
+      [] ->
+        :ok
+    end
+
+    :ok
   end
 
   def update(pid, fun), do: GenServer.call(pid, {:update, fun})
