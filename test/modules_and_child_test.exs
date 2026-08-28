@@ -53,7 +53,9 @@ defmodule Featurevisor.ModulesAndChildTest do
       })
 
     child =
-      Featurevisor.spawn(f, %{"country" => "de"}, %{sticky: %{"flag" => %{"enabled" => true}}})
+      Featurevisor.spawn(f, %{"country" => "de"}, %{
+        sticky_features: %{"flag" => %{"enabled" => true}}
+      })
 
     Featurevisor.set_context(f, %{"country" => "us", "plan" => "pro", "region" => "eu"}, true)
 
@@ -71,7 +73,7 @@ defmodule Featurevisor.ModulesAndChildTest do
              "enabled" => true
            }
 
-    assert Featurevisor.Child.get_all_evaluations(child, %{}, ["flag"])["flag"].enabled
+    assert Featurevisor.Child.get_feature_evaluations(child, %{}, ["flag"])["flag"].enabled
     Featurevisor.Child.close(child)
     assert Featurevisor.Child.set_context(child, %{"country" => "fr"}) == :ok
     assert Featurevisor.Child.set_sticky(child, %{}) == :ok
@@ -96,6 +98,56 @@ defmodule Featurevisor.ModulesAndChildTest do
 
     Featurevisor.set_context(f, %{"country" => "nl"})
     assert_receive {:revision, "test"}
+    Featurevisor.close(f)
+  end
+
+  test "unified modules and child sticky state support global variables" do
+    datafile = %{
+      "schemaVersion" => "2",
+      "revision" => "global",
+      "segments" => %{},
+      "features" => %{},
+      "variables" => %{
+        "message" => %{
+          "type" => "string",
+          "defaultValue" => "default",
+          "overrides" => [
+            %{
+              "key" => "nl",
+              "conditions" => %{"attribute" => "country", "operator" => "equals", "value" => "nl"},
+              "value" => "matched"
+            }
+          ]
+        }
+      }
+    }
+
+    module = %Module{
+      name: "global",
+      before_evaluation: fn options ->
+        %{options | context: Map.put(options.context, "country", "nl")}
+      end,
+      after_evaluation: fn evaluation, _ -> %{evaluation | variable_value: "after"} end
+    }
+
+    f =
+      Featurevisor.create_featurevisor(%{
+        datafile: datafile,
+        sticky_variables: %{"message" => "parent"},
+        modules: [module],
+        log_level: :fatal
+      })
+
+    child = Featurevisor.spawn(f, %{}, %{sticky_variables: %{"message" => "child"}})
+    plain = Featurevisor.spawn(f)
+    assert Featurevisor.get_global_variable(f, "message") == "after"
+    assert Featurevisor.Child.get_global_variable(child, "message") == "after"
+    assert Featurevisor.Child.get_global_variable(plain, "message") == "after"
+
+    Featurevisor.remove_module(f, "global")
+    assert Featurevisor.get_global_variable(f, "message") == "parent"
+    assert Featurevisor.Child.get_global_variable(child, "message") == "child"
+    assert Featurevisor.Child.get_global_variable(plain, "message") == "default"
     Featurevisor.close(f)
   end
 

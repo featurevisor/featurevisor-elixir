@@ -10,7 +10,8 @@ defmodule Featurevisor.CLITest do
   end
 
   test "validates commands before delegating to Node" do
-    assert {:error, "--feature is required"} = Featurevisor.CLI.execute(["benchmark"])
+    assert {:error, "--feature or --variable is required"} =
+             Featurevisor.CLI.execute(["benchmark"])
 
     assert {:error, "--n must be a positive integer"} =
              Featurevisor.CLI.execute(["benchmark", "--feature=foo", "--n=0"])
@@ -22,7 +23,7 @@ defmodule Featurevisor.CLITest do
   end
 
   test "legacy flags remain accepted and ignored" do
-    assert {:error, "--feature is required"} =
+    assert {:error, "--feature or --variable is required"} =
              Featurevisor.CLI.execute([
                "benchmark",
                "--with-scopes",
@@ -30,7 +31,7 @@ defmodule Featurevisor.CLITest do
                "--schemaVersion=1"
              ])
 
-    assert {:error, "--feature is required"} =
+    assert {:error, "--feature or --variable is required"} =
              Featurevisor.CLI.execute(["benchmark", "--schema-version=1"])
   end
 end

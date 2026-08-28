@@ -92,7 +92,7 @@ defmodule FeaturevisorTest do
     context = %{"userId" => "1", "country" => "nl"}
     assert Featurevisor.enabled?(f, "forced", context)
     assert Featurevisor.get_variable(f, "forced", "colour", context) == "orange"
-    all = Featurevisor.get_all_evaluations(f, context, ["forced"])
+    all = Featurevisor.get_feature_evaluations(f, context, ["forced"])
     assert all["forced"].enabled
     assert all["forced"].variables["colour"] == "orange"
   end

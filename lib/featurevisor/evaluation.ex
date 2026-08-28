@@ -11,6 +11,7 @@ defmodule Featurevisor.Evaluation do
           | :variable_not_found
           | :variable_default
           | :variable_disabled
+          | :required_features_unmet
           | :variable_override_variation
           | :variable_override_rule
           | :no_match
@@ -33,14 +34,17 @@ defmodule Featurevisor.Evaluation do
     :traffic,
     :force_index,
     :force,
-    :required,
+    :required_features,
     :sticky,
     :variation,
     :variation_value,
     :variable_key,
     :variable_value,
     :variable_schema,
-    :variable_override_index
+    :variable,
+    :variable_override_index,
+    :variable_override_key,
+    :variable_override_path
   ]
 
   @doc "Converts an evaluation to its camelCase wire representation."
@@ -62,5 +66,8 @@ defmodule Featurevisor.Evaluation do
   defp camelize(:variable_value), do: "variableValue"
   defp camelize(:variable_schema), do: "variableSchema"
   defp camelize(:variable_override_index), do: "variableOverrideIndex"
+  defp camelize(:variable_override_key), do: "variableOverrideKey"
+  defp camelize(:variable_override_path), do: "variableOverridePath"
+  defp camelize(:required_features), do: "requiredFeatures"
   defp camelize(key), do: Atom.to_string(key)
 end

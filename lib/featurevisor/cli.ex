@@ -57,7 +57,10 @@ defmodule Featurevisor.CLI do
 
   defp dispatch(_command, %{help: true}), do: help()
   defp dispatch("test", options), do: TestRunner.run(options)
-  defp dispatch("benchmark", %{feature: nil}), do: {:error, "--feature is required"}
+
+  defp dispatch("benchmark", %{feature: nil, variable: nil}),
+    do: {:error, "--feature or --variable is required"}
+
   defp dispatch("benchmark", %{n: n}) when n <= 0, do: {:error, "--n must be a positive integer"}
 
   defp dispatch("benchmark", %{variation: true, variable: variable}) when is_binary(variable),

@@ -9,8 +9,18 @@ defmodule Featurevisor.Evaluator do
         if module.before, do: module.before.(current), else: current
       end)
 
+    options =
+      Enum.reduce(options.modules, options, fn module, current ->
+        if module.before_evaluation, do: module.before_evaluation.(current), else: current
+      end)
+
     evaluation = evaluate(options)
     evaluation = apply_default(evaluation, options)
+
+    evaluation =
+      Enum.reduce(options.modules, evaluation, fn module, current ->
+        if module.after_evaluation, do: module.after_evaluation.(current, options), else: current
+      end)
 
     Enum.reduce(options.modules, evaluation, fn module, current ->
       if module.after, do: module.after.(current, options), else: current
@@ -387,23 +397,35 @@ defmodule Featurevisor.Evaluator do
     end)
   end
 
-  defp required(%{type: :flag} = options, %{"required" => required})
-       when is_list(required) and required != [] do
-    enabled = Enum.all?(required, &required_enabled?(options, &1))
-    if enabled, do: :continue, else: required_return(options, required)
+  defp required(%{type: :flag} = options, feature) do
+    required = feature["requiredFeatures"] || feature["required"]
+
+    if is_list(required) and required != [] do
+      enabled = Enum.all?(required, &required_enabled?(options, &1))
+      if enabled, do: :continue, else: required_return(options, required)
+    else
+      :continue
+    end
   end
 
   defp required(_, _), do: :continue
 
   defp required_enabled?(options, required) do
-    {key, variation} =
-      if is_binary(required), do: {required, nil}, else: {required["key"], required["variation"]}
+    {key, enabled, variation} =
+      if is_binary(required) do
+        {required, true, nil}
+      else
+        {required["feature"] || required["key"], Map.get(required, "enabled", true),
+         required["variation"]}
+      end
 
-    flag = evaluate(%{options | type: :flag, feature_key: key})
+    flag = evaluate(%{options | type: :flag, feature_key: key, variable_key: nil})
 
-    flag.enabled == true and
+    flag.enabled == true == enabled and
       (is_nil(variation) or
-         variation_value(evaluate(%{options | type: :variation, feature_key: key})) == variation)
+         variation_value(
+           evaluate(%{options | type: :variation, feature_key: key, variable_key: nil})
+         ) == variation)
   end
 
   defp required_return(options, required) do
@@ -411,7 +433,7 @@ defmodule Featurevisor.Evaluator do
       type: :flag,
       feature_key: options.feature_key,
       reason: :required,
-      required: required,
+      required_features: required,
       enabled: false
     }
 
@@ -577,7 +599,9 @@ defmodule Featurevisor.Evaluator do
           variable_key: variable_key,
           variable_schema: schema,
           variable_value: override["value"],
-          variable_override_index: index
+          variable_override_index: index,
+          variable_override_key: override["key"],
+          variable_override_path: override["keyPath"]
         })
 
       match?({:value, _}, traffic_value) ->
@@ -596,7 +620,9 @@ defmodule Featurevisor.Evaluator do
           variable_key: variable_key,
           variable_schema: schema,
           variable_value: override["value"],
-          variable_override_index: index
+          variable_override_index: index,
+          variable_override_key: override["key"],
+          variable_override_path: override["keyPath"]
         })
 
       match?({:value, _}, variation_value_result) ->
@@ -623,28 +649,32 @@ defmodule Featurevisor.Evaluator do
     overrides
     |> Enum.with_index()
     |> Enum.find_value(fn {override, index} ->
+      requirements_match =
+        Enum.all?(override["requiredFeatures"] || [], &required_enabled?(options, &1))
+
+      conditions_match =
+        not Map.has_key?(override, "conditions") or
+          Conditions.all_conditions?(
+            Conditions.parse_conditions(override["conditions"], options.report),
+            options.context,
+            options.regex_cache,
+            options.report
+          )
+
+      segments_match =
+        not Map.has_key?(override, "segments") or
+          Conditions.all_segments?(
+            Conditions.parse_segments(override["segments"]),
+            options.context,
+            options.datafile["segments"],
+            options.regex_cache,
+            options.report
+          )
+
       matched =
-        cond do
-          Map.has_key?(override, "conditions") ->
-            Conditions.all_conditions?(
-              Conditions.parse_conditions(override["conditions"], options.report),
-              options.context,
-              options.regex_cache,
-              options.report
-            )
-
-          Map.has_key?(override, "segments") ->
-            Conditions.all_segments?(
-              Conditions.parse_segments(override["segments"]),
-              options.context,
-              options.datafile["segments"],
-              options.regex_cache,
-              options.report
-            )
-
-          true ->
-            false
-        end
+        requirements_match and conditions_match and segments_match and
+          (Map.has_key?(override, "conditions") or Map.has_key?(override, "segments") or
+             Map.has_key?(override, "requiredFeatures"))
 
       if matched, do: {:override, override, index}
     end)

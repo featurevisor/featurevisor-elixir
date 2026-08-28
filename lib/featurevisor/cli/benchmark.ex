@@ -19,8 +19,13 @@ defmodule Featurevisor.CLI.Benchmark do
           value = evaluator.()
           durations = for _ <- 1..options.n, do: timed(evaluator)
           total = Enum.sum(durations)
-          IO.puts("\nBenchmark Featurevisor feature")
-          IO.puts("Feature: #{options.feature}")
+
+          IO.puts(
+            "\nBenchmark Featurevisor #{if options.feature, do: "feature", else: "variable"}"
+          )
+
+          if options.feature, do: IO.puts("Feature: #{options.feature}")
+          if is_nil(options.feature), do: IO.puts("Variable: #{options.variable}")
           IO.puts("Environment: #{options.environment || false}")
           if target, do: IO.puts("Target: #{target}")
           IO.puts("Iterations: #{options.n}")
@@ -40,7 +45,11 @@ defmodule Featurevisor.CLI.Benchmark do
   end
 
   defp evaluator(f, %{variable: variable, feature: feature}, context) when is_binary(variable),
-    do: fn -> Featurevisor.get_variable(f, feature, variable, context) end
+    do:
+      if(is_binary(feature),
+        do: fn -> Featurevisor.get_variable(f, feature, variable, context) end,
+        else: fn -> Featurevisor.get_global_variable(f, variable, context) end
+      )
 
   defp evaluator(f, %{variation: true, feature: feature}, context),
     do: fn -> Featurevisor.get_variation(f, feature, context) end

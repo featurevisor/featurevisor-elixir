@@ -52,7 +52,7 @@ Add `featurevisor` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:featurevisor, "~> 0.1"}
+    {:featurevisor, "~> 1.0"}
   ]
 end
 ```
@@ -130,11 +130,12 @@ The supervisor owns shutdown and restart. Module close callbacks run during supe
 
 ## Evaluation types
 
-Featurevisor evaluates three kinds of values:
+Featurevisor evaluates four kinds of values:
 
 - a flag answers whether a feature is enabled
 - a variation returns a variation value
-- a variable returns remote configuration for a feature
+- a feature variable returns remote configuration owned by a feature
+- a global variable returns remote configuration independently of a feature
 
 Every evaluation uses the active datafile and the effective context.
 
@@ -221,6 +222,13 @@ title = Featurevisor.get_variable(f, "checkout", "title", context)
 
 JSON variables are decoded before they are returned.
 
+Global variables use explicit function names so feature ownership remains clear:
+
+```elixir
+email = Featurevisor.get_global_variable(f, "supportEmail", context)
+evaluation = Featurevisor.evaluate_global_variable(f, "supportEmail", context)
+```
+
 ### Type specific getters
 
 Use a typed getter when your application wants runtime type validation:
@@ -240,14 +248,18 @@ Typed getters return `nil` for a mismatched value and do not coerce strings, boo
 ## Getting all evaluations
 
 ```elixir
-evaluations = Featurevisor.get_all_evaluations(f, context)
+features = Featurevisor.get_feature_evaluations(f, context)
+variables = Featurevisor.get_global_variable_evaluations(f, context)
 ```
 
 Pass feature keys to evaluate a selected set:
 
 ```elixir
-evaluations = Featurevisor.get_all_evaluations(f, context, ["checkout", "pricing"])
+features = Featurevisor.get_feature_evaluations(f, context, ["checkout", "pricing"])
+variables = Featurevisor.get_global_variable_evaluations(f, context, ["supportEmail"])
 ```
+
+`get_all_evaluations/4` is a deprecated alias for `get_feature_evaluations/4`.
 
 ## Sticky
 
@@ -258,21 +270,23 @@ Sticky values keep selected evaluations stable for the lifetime of an instance o
 ```elixir
 f = Featurevisor.create_featurevisor(%{
   datafile: datafile,
-  sticky: %{
+  sticky_features: %{
     "checkout" => %{
       "enabled" => true,
       "variation" => "treatment",
       "variables" => %{"title" => "Welcome back"}
     }
-  }
+  },
+  sticky_variables: %{"supportEmail" => "sticky@example.com"}
 })
 ```
 
 ### Updating sticky values
 
 ```elixir
-Featurevisor.set_sticky(f, sticky)
-Featurevisor.set_sticky(f, replacement, true)
+Featurevisor.set_sticky_features(f, sticky_features)
+Featurevisor.set_sticky_variables(f, sticky_variables)
+Featurevisor.set_sticky_features(f, replacement, true)
 ```
 
 Sticky values are instance state. They are not accepted as public per evaluation options.
@@ -283,7 +297,7 @@ Sticky values are instance state. They are not accepted as public per evaluation
 
 ### Merging by default
 
-Incoming features and segments are merged into the stored datafile. Incoming entries replace entries with the same key.
+Incoming features, global variables, and segments are merged into the stored datafile. Incoming entries replace entries with the same key.
 
 ```elixir
 Featurevisor.set_datafile(f, next_datafile)
@@ -346,7 +360,10 @@ Supported events are:
 - `:datafile_set`
 - `:context_set`
 - `:sticky_set`
+- `:sticky_variables_set`
 - `:error`
+
+The `:datafile_set` details include changed `features` and `variables`, including dependants affected by changed required features or segments.
 
 ## Evaluation details
 
@@ -356,6 +373,7 @@ Use detailed methods when you need reasons, rule keys, bucket values, or matched
 flag = Featurevisor.evaluate_flag(f, "checkout", context)
 variation = Featurevisor.evaluate_variation(f, "checkout", context)
 variable = Featurevisor.evaluate_variable(f, "checkout", "title", context)
+global_variable = Featurevisor.evaluate_global_variable(f, "supportEmail", context)
 ```
 
 Each method returns a `Featurevisor.Evaluation` struct.
@@ -370,13 +388,13 @@ module = %Featurevisor.Module{
   setup: fn api ->
     IO.puts("Revision: #{api.get_revision.()}")
   end,
-  before: fn options ->
+  before_evaluation: fn options ->
     %{options | context: Map.put_new(options.context, "service", "checkout")}
   end,
   bucket_value: fn options ->
     options.bucket_value
   end,
-  after: fn evaluation, _options ->
+  after_evaluation: fn evaluation, _options ->
     evaluation
   end,
   close: fn ->
@@ -388,7 +406,7 @@ remove = Featurevisor.add_module(f, module)
 remove.()
 ```
 
-Module callbacks are `setup`, `before`, `bucket_key`, `bucket_value`, `after`, and `close`. Callback option maps use idiomatic snake case keys such as `bucket_key` and `bucket_value`.
+Module callbacks are `setup`, `before_evaluation`, `bucket_key`, `bucket_value`, `after_evaluation`, and `close`. The older `before` and `after` callbacks remain feature only compatibility callbacks. Callback option maps use idiomatic snake case keys such as `bucket_key` and `bucket_value`.
 
 Named duplicates are rejected with a `duplicate_module` diagnostic. A failed setup is removed, its diagnostic subscriptions are cleared, and its close callback is invoked.
 
@@ -400,14 +418,16 @@ A child has isolated context, sticky state, and local listeners while sharing it
 child = Featurevisor.spawn(
   f,
   %{"accountId" => "account-123"},
-  %{sticky: sticky}
+  %{sticky_features: sticky_features, sticky_variables: sticky_variables}
 )
 
 Featurevisor.Child.enabled?(child, "checkout", %{"userId" => "user-456"})
 Featurevisor.Child.get_variation(child, "checkout")
 Featurevisor.Child.get_variable(child, "checkout", "title")
 Featurevisor.Child.get_variable_string(child, "checkout", "title")
-Featurevisor.Child.get_all_evaluations(child)
+Featurevisor.Child.get_global_variable(child, "supportEmail")
+Featurevisor.Child.get_feature_evaluations(child)
+Featurevisor.Child.get_global_variable_evaluations(child)
 
 Featurevisor.Child.close(child)
 ```
@@ -466,6 +486,8 @@ Use one or more Targets when required:
 ```
 
 Benchmark output reports total duration and the minimum, average, and maximum duration of individual evaluations.
+
+Pass `--variable=supportEmail` without `--feature` to benchmark a global variable.
 
 ### Assess distribution
 

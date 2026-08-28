@@ -15,7 +15,8 @@ defmodule Featurevisor.Child do
       Agent.start(fn ->
         %{
           context: stored,
-          sticky: Map.get(options, :sticky, %{}),
+          sticky_features: Map.get(options, :sticky_features, %{}),
+          sticky_variables: Map.get(options, :sticky_variables, %{}),
           listeners: %{},
           unsubs: [],
           closed: false
@@ -49,24 +50,53 @@ defmodule Featurevisor.Child do
 
   @doc "Merges or replaces child sticky values."
   def set_sticky(child, sticky, replace \\ false) do
-    if Process.alive?(child.agent), do: set_live_sticky(child, sticky, replace), else: :ok
+    set_sticky_features(child, sticky, replace)
   end
 
-  defp set_live_sticky(child, sticky, replace) do
+  @doc "Merges or replaces child sticky feature values."
+  def set_sticky_features(child, sticky, replace \\ false) do
+    if Process.alive?(child.agent),
+      do: set_live_sticky_features(child, sticky, replace),
+      else: :ok
+  end
+
+  defp set_live_sticky_features(child, sticky, replace) do
     details =
       Agent.get_and_update(child.agent, fn state ->
-        value = if replace, do: sticky, else: Map.merge(state.sticky, sticky)
+        value = if replace, do: sticky, else: Map.merge(state.sticky_features, sticky)
 
-        {%{features: Enum.uniq(Map.keys(state.sticky) ++ Map.keys(value)), replaced: replace},
-         %{state | sticky: value}}
+        {%{
+           features: Enum.uniq(Map.keys(state.sticky_features) ++ Map.keys(value)),
+           replaced: replace
+         }, %{state | sticky_features: value}}
       end)
 
     trigger(child, :sticky_set, details)
     :ok
   end
 
+  @doc "Merges or replaces child sticky global variable values."
+  def set_sticky_variables(child, sticky, replace \\ false) do
+    if Process.alive?(child.agent) do
+      details =
+        Agent.get_and_update(child.agent, fn state ->
+          value = if replace, do: sticky, else: Map.merge(state.sticky_variables, sticky)
+
+          {%{
+             variables: Enum.uniq(Map.keys(state.sticky_variables) ++ Map.keys(value)),
+             replaced: replace
+           }, %{state | sticky_variables: value}}
+        end)
+
+      trigger(child, :sticky_variables_set, details)
+    end
+
+    :ok
+  end
+
   @doc "Subscribes to a child or delegated parent event."
-  def on(child, event, callback) when event in [:context_set, :sticky_set] do
+  def on(child, event, callback)
+      when event in [:context_set, :sticky_set, :sticky_variables_set] do
     if Process.alive?(child.agent) do
       subscribe_to_local_event(child, event, callback)
     else
@@ -199,11 +229,66 @@ defmodule Featurevisor.Child do
     do: typed_variable(child, :get_variable_json, key, variable, context, options)
 
   @doc "Evaluates all or selected features through the parent instance."
-  def get_all_evaluations(child, context \\ %{}, feature_keys \\ [], options \\ %{}) do
-    Featurevisor.get_all_evaluations(
+  def get_feature_evaluations(child, context \\ %{}, feature_keys \\ [], options \\ %{}) do
+    Featurevisor.get_feature_evaluations(
       child.parent,
       get_context(child, context),
       feature_keys,
+      child_options(child, options)
+    )
+  end
+
+  @doc "Deprecated alias for get_feature_evaluations/4."
+  @deprecated "Use get_feature_evaluations/4"
+  def get_all_evaluations(child, context \\ %{}, feature_keys \\ [], options \\ %{}),
+    do: get_feature_evaluations(child, context, feature_keys, options)
+
+  @doc "Evaluates a global variable through the parent instance."
+  def evaluate_global_variable(child, key, context \\ %{}, options \\ %{}),
+    do:
+      Featurevisor.evaluate_global_variable(
+        child.parent,
+        key,
+        get_context(child, context),
+        child_options(child, options)
+      )
+
+  @doc "Returns a global variable value."
+  def get_global_variable(child, key, context \\ %{}, options \\ %{}),
+    do:
+      Featurevisor.get_global_variable(
+        child.parent,
+        key,
+        get_context(child, context),
+        child_options(child, options)
+      )
+
+  for {name, function} <- [
+        boolean: :get_global_variable_boolean,
+        string: :get_global_variable_string,
+        integer: :get_global_variable_integer,
+        double: :get_global_variable_double,
+        array: :get_global_variable_array,
+        object: :get_global_variable_object,
+        json: :get_global_variable_json
+      ] do
+    @doc "Returns a typed #{name} global variable."
+    def unquote(function)(child, key, context \\ %{}, options \\ %{}) do
+      apply(Featurevisor, unquote(function), [
+        child.parent,
+        key,
+        get_context(child, context),
+        child_options(child, options)
+      ])
+    end
+  end
+
+  @doc "Evaluates all or selected global variables through the parent instance."
+  def get_global_variable_evaluations(child, context \\ %{}, variable_keys \\ [], options \\ %{}) do
+    Featurevisor.get_global_variable_evaluations(
+      child.parent,
+      get_context(child, context),
+      variable_keys,
       child_options(child, options)
     )
   end
@@ -222,10 +307,14 @@ defmodule Featurevisor.Child do
   defp child_options(child, options) do
     options = if is_list(options), do: Map.new(options), else: options
 
-    sticky =
-      if Process.alive?(child.agent), do: Agent.get(child.agent, & &1.sticky), else: %{}
+    {sticky_features, sticky_variables} =
+      if Process.alive?(child.agent),
+        do: Agent.get(child.agent, &{&1.sticky_features, &1.sticky_variables}),
+        else: {%{}, %{}}
 
-    Map.put(options, :__child_sticky, sticky)
+    options
+    |> Map.put(:__child_sticky_features, sticky_features)
+    |> Map.put(:__child_sticky_variables, sticky_variables)
   end
 
   defp typed_variable(child, function, key, variable, context, options) do
