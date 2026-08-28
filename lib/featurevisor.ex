@@ -155,11 +155,6 @@ defmodule Featurevisor do
   @doc "Returns stored context merged with optional evaluation context."
   def get_context(instance, context \\ %{}), do: Map.merge(snapshot(instance).context, context)
 
-  @doc "Merges or replaces sticky evaluations."
-  def set_sticky(instance, sticky, replace \\ false) when is_map(sticky) do
-    set_sticky_features(instance, sticky, replace)
-  end
-
   @doc "Merges or replaces sticky feature evaluations."
   def set_sticky_features(instance, sticky, replace \\ false) when is_map(sticky) do
     if open?(instance), do: set_live_sticky_features(instance, sticky, replace), else: :ok
@@ -176,14 +171,15 @@ defmodule Featurevisor do
       end)
 
     details = %{features: keys, replaced: replace}
-    trigger(instance, :sticky_set, details)
 
     report(instance, %{
       level: :info,
-      code: "sticky_set",
+      code: "sticky_features_set",
       message: "Sticky features set",
       details: details
     })
+
+    trigger(instance, :sticky_features_set, details)
 
     :ok
   end
@@ -201,7 +197,6 @@ defmodule Featurevisor do
         end)
 
       details = %{variables: keys, replaced: replace}
-      trigger(instance, :sticky_variables_set, details)
 
       report(instance, %{
         level: :info,
@@ -209,6 +204,8 @@ defmodule Featurevisor do
         message: "Sticky variables set",
         details: details
       })
+
+      trigger(instance, :sticky_variables_set, details)
     end
 
     :ok
@@ -579,11 +576,6 @@ defmodule Featurevisor do
     Map.new(keys, &{&1, get_global_variable(instance, &1, context, options)})
   end
 
-  @doc "Deprecated alias for get_feature_evaluations/4."
-  @deprecated "Use get_feature_evaluations/4"
-  def get_all_evaluations(instance, context \\ %{}, feature_keys \\ [], options \\ %{}),
-    do: get_feature_evaluations(instance, context, feature_keys, options)
-
   @doc false
   def segment_matches?(instance, segment_key, context \\ %{}) do
     snap = snapshot(instance)
@@ -689,7 +681,13 @@ defmodule Featurevisor do
 
   @doc "Subscribes to an event and returns an idempotent unsubscribe function."
   def on(instance, event, callback)
-      when event in [:datafile_set, :context_set, :sticky_set, :sticky_variables_set, :error] and
+      when event in [
+             :datafile_set,
+             :context_set,
+             :sticky_features_set,
+             :sticky_variables_set,
+             :error
+           ] and
              is_function(callback, 1) do
     if open?(instance) do
       subscribe_to_event(instance, event, callback)

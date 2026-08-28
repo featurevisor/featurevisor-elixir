@@ -48,11 +48,6 @@ defmodule Featurevisor.Child do
     Featurevisor.get_context(child.parent) |> Map.merge(stored) |> Map.merge(context)
   end
 
-  @doc "Merges or replaces child sticky values."
-  def set_sticky(child, sticky, replace \\ false) do
-    set_sticky_features(child, sticky, replace)
-  end
-
   @doc "Merges or replaces child sticky feature values."
   def set_sticky_features(child, sticky, replace \\ false) do
     if Process.alive?(child.agent),
@@ -71,7 +66,7 @@ defmodule Featurevisor.Child do
          }, %{state | sticky_features: value}}
       end)
 
-    trigger(child, :sticky_set, details)
+    trigger(child, :sticky_features_set, details)
     :ok
   end
 
@@ -96,7 +91,7 @@ defmodule Featurevisor.Child do
 
   @doc "Subscribes to a child or delegated parent event."
   def on(child, event, callback)
-      when event in [:context_set, :sticky_set, :sticky_variables_set] do
+      when event in [:context_set, :sticky_features_set, :sticky_variables_set] do
     if Process.alive?(child.agent) do
       subscribe_to_local_event(child, event, callback)
     else
@@ -237,11 +232,6 @@ defmodule Featurevisor.Child do
       child_options(child, options)
     )
   end
-
-  @doc "Deprecated alias for get_feature_evaluations/4."
-  @deprecated "Use get_feature_evaluations/4"
-  def get_all_evaluations(child, context \\ %{}, feature_keys \\ [], options \\ %{}),
-    do: get_feature_evaluations(child, context, feature_keys, options)
 
   @doc "Evaluates a global variable through the parent instance."
   def evaluate_global_variable(child, key, context \\ %{}, options \\ %{}),

@@ -145,7 +145,7 @@ defmodule FeaturevisorTest do
 
     assert Featurevisor.set_datafile(f, Featurevisor.TestFixtures.datafile(), true) == :ok
     assert Featurevisor.set_context(f, %{"country" => "nl"}) == :ok
-    assert Featurevisor.set_sticky(f, %{"flag" => %{"enabled" => true}}) == :ok
+    assert Featurevisor.set_sticky_features(f, %{"flag" => %{"enabled" => true}}) == :ok
     assert Featurevisor.set_log_level(f, :debug) == :ok
     assert Featurevisor.remove_module(f, "missing") == :ok
     assert Featurevisor.add_module(f, %Module{name: "late"}) == nil

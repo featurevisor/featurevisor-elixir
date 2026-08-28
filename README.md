@@ -259,8 +259,6 @@ features = Featurevisor.get_feature_evaluations(f, context, ["checkout", "pricin
 variables = Featurevisor.get_global_variable_evaluations(f, context, ["supportEmail"])
 ```
 
-`get_all_evaluations/4` is a deprecated alias for `get_feature_evaluations/4`.
-
 ## Sticky
 
 Sticky values keep selected evaluations stable for the lifetime of an instance or child instance.
@@ -359,7 +357,7 @@ Supported events are:
 
 - `:datafile_set`
 - `:context_set`
-- `:sticky_set`
+- `:sticky_features_set`
 - `:sticky_variables_set`
 - `:error`
 
@@ -406,7 +404,7 @@ remove = Featurevisor.add_module(f, module)
 remove.()
 ```
 
-Module callbacks are `setup`, `before_evaluation`, `bucket_key`, `bucket_value`, `after_evaluation`, and `close`. The older `before` and `after` callbacks remain feature only compatibility callbacks. Callback option maps use idiomatic snake case keys such as `bucket_key` and `bucket_value`.
+Module callbacks are `setup`, `before`, `before_evaluation`, `bucket_key`, `bucket_value`, `after_evaluation`, `after`, and `close`. For feature evaluations, all `before` callbacks run in registration order, followed by all `before_evaluation` callbacks. After evaluation and caller defaults, all `after_evaluation` callbacks run, followed by all `after` callbacks. Global variable evaluations use only `before_evaluation` and `after_evaluation`. Required feature checks run through the complete module pipeline, and transformed defaults are preserved. Callback option maps use idiomatic snake case keys such as `bucket_key` and `bucket_value`.
 
 Named duplicates are rejected with a `duplicate_module` diagnostic. A failed setup is removed, its diagnostic subscriptions are cleared, and its close callback is invoked.
 

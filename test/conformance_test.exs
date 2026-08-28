@@ -5,7 +5,7 @@ defmodule Featurevisor.ConformanceTest do
   @fixture Path.expand("../conformance/sdk-v3.json", __DIR__) |> File.read!() |> Jason.decode!()
 
   test "executes the canonical fixture version and bucket boundaries" do
-    assert @fixture["version"] == 5
+    assert @fixture["version"] == 6
     assert is_binary(@fixture["description"])
 
     assert Enum.sort(Map.keys(@fixture)) ==
@@ -24,6 +24,9 @@ defmodule Featurevisor.ConformanceTest do
                "conditionCases",
                "childInstances",
                "defaults",
+               "modulePipeline",
+               "lifecycle",
+               "openFeature",
                "diagnosticCase",
                "nativeContexts"
              ])

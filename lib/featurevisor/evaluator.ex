@@ -53,10 +53,13 @@ defmodule Featurevisor.Evaluator do
        do: %{evaluation | variation_value: options.default_variation_value}
 
   defp apply_default(
-         %Evaluation{type: :variable, variable_value: nil} = evaluation,
+         %Evaluation{type: :variable} = evaluation,
          %{default_variable_present: true} = options
-       ),
-       do: %{evaluation | variable_value: options.default_variable_value}
+       ) do
+    if variable_value_present?(evaluation),
+      do: evaluation,
+      else: %{evaluation | variable_value: options.default_variable_value}
+  end
 
   defp apply_default(evaluation, _), do: evaluation
 
@@ -419,12 +422,17 @@ defmodule Featurevisor.Evaluator do
          required["variation"]}
       end
 
-    flag = evaluate(%{options | type: :flag, feature_key: key, variable_key: nil})
+    flag = evaluate_with_modules(%{options | type: :flag, feature_key: key, variable_key: nil})
 
     flag.enabled == true == enabled and
       (is_nil(variation) or
          variation_value(
-           evaluate(%{options | type: :variation, feature_key: key, variable_key: nil})
+           evaluate_with_modules(%{
+             options
+             | type: :variation,
+               feature_key: key,
+               variable_key: nil
+           })
          ) == variation)
   end
 
@@ -698,6 +706,27 @@ defmodule Featurevisor.Evaluator do
 
     struct(Evaluation, Map.merge(base, extras))
   end
+
+  defp variable_value_present?(%Evaluation{variable_value: value}) when not is_nil(value),
+    do: true
+
+  defp variable_value_present?(%Evaluation{reason: reason})
+       when reason in [
+              :sticky,
+              :forced,
+              :rule,
+              :allocated,
+              :variable_disabled,
+              :variable_override_rule,
+              :variable_override_variation
+            ],
+       do: true
+
+  defp variable_value_present?(%Evaluation{reason: :variable_default, variable_schema: schema})
+       when is_map(schema),
+       do: Map.has_key?(schema, "defaultValue")
+
+  defp variable_value_present?(_), do: false
 
   defp variation_value(%Evaluation{variation_value: value}) when not is_nil(value), do: value
 
