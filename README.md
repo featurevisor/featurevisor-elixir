@@ -406,6 +406,8 @@ remove.()
 
 Module callbacks are `setup`, `before`, `before_evaluation`, `bucket_key`, `bucket_value`, `after_evaluation`, `after`, and `close`. For feature evaluations, all `before` callbacks run in registration order, followed by all `before_evaluation` callbacks. After evaluation and caller defaults, all `after_evaluation` callbacks run, followed by all `after` callbacks. Global variable evaluations use only `before_evaluation` and `after_evaluation`. Required feature checks run through the complete module pipeline, and transformed defaults are preserved. Callback option maps use idiomatic snake case keys such as `bucket_key` and `bucket_value`.
 
+`before` and `after` remain available as deprecated feature-only compatibility callbacks. Use `before_evaluation` and `after_evaluation` for new modules so the same callbacks can handle feature and global variable evaluations.
+
 Named duplicates are rejected with a `duplicate_module` diagnostic. A failed setup is removed, its diagnostic subscriptions are cleared, and its close callback is invoked.
 
 ## Child instance
