@@ -92,7 +92,7 @@ defmodule FeaturevisorTest do
     context = %{"userId" => "1", "country" => "nl"}
     assert Featurevisor.enabled?(f, "forced", context)
     assert Featurevisor.get_variable(f, "forced", "colour", context) == "orange"
-    all = Featurevisor.get_all_evaluations(f, context, ["forced"])
+    all = Featurevisor.get_feature_evaluations(f, context, ["forced"])
     assert all["forced"].enabled
     assert all["forced"].variables["colour"] == "orange"
   end
@@ -145,7 +145,7 @@ defmodule FeaturevisorTest do
 
     assert Featurevisor.set_datafile(f, Featurevisor.TestFixtures.datafile(), true) == :ok
     assert Featurevisor.set_context(f, %{"country" => "nl"}) == :ok
-    assert Featurevisor.set_sticky(f, %{"flag" => %{"enabled" => true}}) == :ok
+    assert Featurevisor.set_sticky_features(f, %{"flag" => %{"enabled" => true}}) == :ok
     assert Featurevisor.set_log_level(f, :debug) == :ok
     assert Featurevisor.remove_module(f, "missing") == :ok
     assert Featurevisor.add_module(f, %Module{name: "late"}) == nil

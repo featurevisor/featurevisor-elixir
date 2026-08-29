@@ -17,7 +17,8 @@ defmodule Featurevisor do
           optional(:context) => map(),
           optional(:log_level) => Diagnostic.level(),
           optional(:on_diagnostic) => (Diagnostic.t() -> any()),
-          optional(:sticky) => map(),
+          optional(:sticky_features) => map(),
+          optional(:sticky_variables) => map(),
           optional(:modules) => [Module.t()],
           optional(:name) => GenServer.name()
         }
@@ -154,28 +155,58 @@ defmodule Featurevisor do
   @doc "Returns stored context merged with optional evaluation context."
   def get_context(instance, context \\ %{}), do: Map.merge(snapshot(instance).context, context)
 
-  @doc "Merges or replaces sticky evaluations."
-  def set_sticky(instance, sticky, replace \\ false) when is_map(sticky) do
-    if open?(instance), do: set_live_sticky(instance, sticky, replace), else: :ok
+  @doc "Merges or replaces sticky feature evaluations."
+  def set_sticky_features(instance, sticky, replace \\ false) when is_map(sticky) do
+    if open?(instance), do: set_live_sticky_features(instance, sticky, replace), else: :ok
   end
 
-  defp set_live_sticky(instance, sticky, replace) do
+  defp set_live_sticky_features(instance, sticky, replace) do
     {_resolved, keys} =
       Server.update(instance.pid, fn snapshot ->
-        previous = snapshot.sticky || %{}
+        previous = snapshot.sticky_features || %{}
         value = if replace, do: sticky, else: Map.merge(previous, sticky)
-        {{value, Enum.uniq(Map.keys(previous) ++ Map.keys(value))}, %{snapshot | sticky: value}}
+
+        {{value, Enum.uniq(Map.keys(previous) ++ Map.keys(value))},
+         %{snapshot | sticky_features: value}}
       end)
 
     details = %{features: keys, replaced: replace}
-    trigger(instance, :sticky_set, details)
 
     report(instance, %{
       level: :info,
-      code: "sticky_set",
+      code: "sticky_features_set",
       message: "Sticky features set",
       details: details
     })
+
+    trigger(instance, :sticky_features_set, details)
+
+    :ok
+  end
+
+  @doc "Merges or replaces sticky global variable values."
+  def set_sticky_variables(instance, sticky, replace \\ false) when is_map(sticky) do
+    if open?(instance) do
+      {_resolved, keys} =
+        Server.update(instance.pid, fn snapshot ->
+          previous = snapshot.sticky_variables || %{}
+          value = if replace, do: sticky, else: Map.merge(previous, sticky)
+
+          {{value, Enum.uniq(Map.keys(previous) ++ Map.keys(value))},
+           %{snapshot | sticky_variables: value}}
+        end)
+
+      details = %{variables: keys, replaced: replace}
+
+      report(instance, %{
+        level: :info,
+        code: "sticky_variables_set",
+        message: "Sticky variables set",
+        details: details
+      })
+
+      trigger(instance, :sticky_variables_set, details)
+    end
 
     :ok
   end
@@ -211,6 +242,10 @@ defmodule Featurevisor do
   @doc "Returns variable keys for a feature."
   def get_variable_keys(instance, key),
     do: instance |> get_feature(key) |> then(&Map.keys((&1 && &1["variablesSchema"]) || %{}))
+
+  @doc "Returns all global variable keys. Ordering is not guaranteed."
+  def get_global_variable_keys(instance),
+    do: Map.keys(snapshot(instance).datafile["variables"] || %{})
 
   @doc "Returns whether a feature defines variations."
   def has_variations?(instance, key),
@@ -292,8 +327,218 @@ defmodule Featurevisor do
   def get_variable_json(instance, feature, variable, context \\ %{}, options \\ %{}),
     do: get_variable(instance, feature, variable, context, options)
 
+  @doc "Evaluates a global variable and returns details."
+  def evaluate_global_variable(instance, variable_key, context \\ %{}, options \\ %{}) do
+    snap = snapshot(instance)
+    options = normalize_options(options)
+
+    evaluation_options = %{
+      type: :variable,
+      variable_key: variable_key,
+      context: Map.merge(snap.context, context),
+      default_variable_present: Map.has_key?(options, :default_variable_value),
+      default_variable_value: Map.get(options, :default_variable_value)
+    }
+
+    try do
+      evaluation_options =
+        Enum.reduce(snap.modules, evaluation_options, fn module, current ->
+          if module.before_evaluation, do: module.before_evaluation.(current), else: current
+        end)
+
+      resolved_key = evaluation_options.variable_key
+      variable = get_in(snap.datafile, ["variables", resolved_key])
+      sticky = Map.get(options, :__child_sticky_variables, snap.sticky_variables || %{})
+
+      evaluation =
+        cond do
+          Map.has_key?(sticky, resolved_key) ->
+            %Featurevisor.Evaluation{
+              type: :variable,
+              variable_key: resolved_key,
+              variable: variable,
+              variable_value: sticky[resolved_key],
+              reason: :sticky
+            }
+
+          variable &&
+              not required_features_match?(
+                instance,
+                variable["requiredFeatures"],
+                evaluation_options.context,
+                options
+              ) ->
+            value =
+              if variable["useDefaultWhenDisabled"],
+                do: variable["defaultValue"],
+                else: variable["disabledValue"]
+
+            %Featurevisor.Evaluation{
+              type: :variable,
+              variable_key: resolved_key,
+              variable: variable,
+              variable_value: value,
+              reason: :required_features_unmet
+            }
+
+          variable ->
+            case matched_global_override(
+                   instance,
+                   snap,
+                   variable["overrides"] || [],
+                   evaluation_options.context,
+                   options
+                 ) do
+              {override, index} ->
+                %Featurevisor.Evaluation{
+                  type: :variable,
+                  variable_key: resolved_key,
+                  variable: variable,
+                  variable_value: override["value"],
+                  variable_override_index: index,
+                  variable_override_key: override["key"],
+                  variable_override_path: override["keyPath"],
+                  reason: :variable_override_rule
+                }
+
+              nil ->
+                %Featurevisor.Evaluation{
+                  type: :variable,
+                  variable_key: resolved_key,
+                  variable: variable,
+                  variable_value: variable["defaultValue"],
+                  reason: :variable_default
+                }
+            end
+
+          true ->
+            %Featurevisor.Evaluation{
+              type: :variable,
+              variable_key: resolved_key,
+              reason: :variable_not_found
+            }
+        end
+
+      value_present =
+        case evaluation.reason do
+          :sticky ->
+            true
+
+          :variable_override_rule ->
+            true
+
+          :variable_default ->
+            variable && Map.has_key?(variable, "defaultValue")
+
+          :required_features_unmet ->
+            variable &&
+              Map.has_key?(
+                variable,
+                if(variable["useDefaultWhenDisabled"], do: "defaultValue", else: "disabledValue")
+              )
+
+          _ ->
+            false
+        end
+
+      evaluation =
+        if not value_present and evaluation_options.default_variable_present,
+          do: %{evaluation | variable_value: evaluation_options.default_variable_value},
+          else: evaluation
+
+      evaluation =
+        Enum.reduce(snap.modules, evaluation, fn module, current ->
+          if module.after_evaluation,
+            do: module.after_evaluation.(current, evaluation_options),
+            else: current
+        end)
+
+      if variable && variable["deprecated"] do
+        report(instance, %{
+          level: :warn,
+          code: "variable_deprecated",
+          message: "Variable \"#{resolved_key}\" is deprecated",
+          details: %{
+            variableKey: resolved_key,
+            evaluation: Featurevisor.Evaluation.to_map(evaluation)
+          }
+        })
+      end
+
+      report(instance, %{
+        level: :debug,
+        code: Atom.to_string(evaluation.reason),
+        message: "Global variable evaluated",
+        details: Featurevisor.Evaluation.to_map(evaluation)
+      })
+
+      evaluation
+    rescue
+      error ->
+        evaluation = %Featurevisor.Evaluation{
+          type: :variable,
+          variable_key: variable_key,
+          reason: :error,
+          error: error
+        }
+
+        report(instance, %{
+          level: :error,
+          code: "evaluation_error",
+          message: "Global variable evaluation failed",
+          originalError: error,
+          details: Featurevisor.Evaluation.to_map(evaluation)
+        })
+
+        evaluation
+    end
+  end
+
+  @doc "Returns a global variable value or nil. JSON variables are decoded."
+  def get_global_variable(instance, variable_key, context \\ %{}, options \\ %{}) do
+    evaluation = evaluate_global_variable(instance, variable_key, context, options)
+    value = evaluation.variable_value
+
+    if get_in(evaluation.variable || %{}, ["type"]) == "json" and is_binary(value) do
+      case Jason.decode(value) do
+        {:ok, parsed} -> parsed
+        {:error, _error} -> nil
+      end
+    else
+      value
+    end
+  end
+
+  @doc "Returns a typed boolean global variable."
+  def get_global_variable_boolean(instance, key, context \\ %{}, options \\ %{}),
+    do: typed(get_global_variable(instance, key, context, options), :boolean)
+
+  @doc "Returns a typed string global variable."
+  def get_global_variable_string(instance, key, context \\ %{}, options \\ %{}),
+    do: typed(get_global_variable(instance, key, context, options), :string)
+
+  @doc "Returns a typed integer global variable."
+  def get_global_variable_integer(instance, key, context \\ %{}, options \\ %{}),
+    do: typed(get_global_variable(instance, key, context, options), :integer)
+
+  @doc "Returns a typed numeric global variable."
+  def get_global_variable_double(instance, key, context \\ %{}, options \\ %{}),
+    do: typed(get_global_variable(instance, key, context, options), :double)
+
+  @doc "Returns a typed list global variable."
+  def get_global_variable_array(instance, key, context \\ %{}, options \\ %{}),
+    do: typed(get_global_variable(instance, key, context, options), :array)
+
+  @doc "Returns a typed map global variable."
+  def get_global_variable_object(instance, key, context \\ %{}, options \\ %{}),
+    do: typed(get_global_variable(instance, key, context, options), :object)
+
+  @doc "Returns a decoded JSON global variable."
+  def get_global_variable_json(instance, key, context \\ %{}, options \\ %{}),
+    do: get_global_variable(instance, key, context, options)
+
   @doc "Evaluates all or selected features."
-  def get_all_evaluations(instance, context \\ %{}, feature_keys \\ [], options \\ %{}) do
+  def get_feature_evaluations(instance, context \\ %{}, feature_keys \\ [], options \\ %{}) do
     keys = if feature_keys == [], do: get_feature_keys(instance), else: feature_keys
 
     Map.new(keys, fn key ->
@@ -318,6 +563,17 @@ defmodule Featurevisor do
 
       {key, value}
     end)
+  end
+
+  @doc "Evaluates all or selected global variables."
+  def get_global_variable_evaluations(
+        instance,
+        context \\ %{},
+        variable_keys \\ [],
+        options \\ %{}
+      ) do
+    keys = if variable_keys == [], do: get_global_variable_keys(instance), else: variable_keys
+    Map.new(keys, &{&1, get_global_variable(instance, &1, context, options)})
   end
 
   @doc false
@@ -425,7 +681,13 @@ defmodule Featurevisor do
 
   @doc "Subscribes to an event and returns an idempotent unsubscribe function."
   def on(instance, event, callback)
-      when event in [:datafile_set, :context_set, :sticky_set, :error] and
+      when event in [
+             :datafile_set,
+             :context_set,
+             :sticky_features_set,
+             :sticky_variables_set,
+             :error
+           ] and
              is_function(callback, 1) do
     if open?(instance) do
       subscribe_to_event(instance, event, callback)
@@ -491,7 +753,7 @@ defmodule Featurevisor do
       regex_cache: snap.regex_cache,
       report: reporter(instance),
       modules: snap.modules,
-      sticky: Map.get(options, :__child_sticky, snap.sticky),
+      sticky: Map.get(options, :__child_sticky_features, snap.sticky_features),
       default_variation_present: Map.has_key?(options, :default_variation_value),
       default_variation_value: Map.get(options, :default_variation_value),
       default_variable_present: Map.has_key?(options, :default_variable_value),
@@ -499,6 +761,53 @@ defmodule Featurevisor do
     }
 
     Evaluator.evaluate_with_modules(evaluation_options)
+  end
+
+  defp required_features_match?(_instance, nil, _context, _options), do: true
+
+  defp required_features_match?(instance, requirements, context, options) do
+    Enum.all?(requirements, fn requirement ->
+      {feature, enabled, variation} =
+        if is_binary(requirement) do
+          {requirement, true, nil}
+        else
+          {requirement["feature"] || requirement["key"], Map.get(requirement, "enabled", true),
+           requirement["variation"]}
+        end
+
+      enabled?(instance, feature, context, options) == enabled and
+        (is_nil(variation) or get_variation(instance, feature, context, options) == variation)
+    end)
+  end
+
+  defp matched_global_override(instance, snap, overrides, context, options) do
+    overrides
+    |> Enum.with_index()
+    |> Enum.find_value(fn {override, index} ->
+      requirements_match =
+        required_features_match?(instance, override["requiredFeatures"], context, options)
+
+      conditions_match =
+        not Map.has_key?(override, "conditions") or
+          Conditions.all_conditions?(
+            Conditions.parse_conditions(override["conditions"], reporter(instance)),
+            context,
+            snap.regex_cache,
+            reporter(instance)
+          )
+
+      segments_match =
+        not Map.has_key?(override, "segments") or
+          Conditions.all_segments?(
+            Conditions.parse_segments(override["segments"]),
+            context,
+            snap.datafile["segments"],
+            snap.regex_cache,
+            reporter(instance)
+          )
+
+      if requirements_match and conditions_match and segments_match, do: {override, index}
+    end)
   end
 
   defp typed(value, :boolean) when is_boolean(value), do: value

@@ -5,7 +5,7 @@ defmodule Featurevisor.ConformanceTest do
   @fixture Path.expand("../conformance/sdk-v3.json", __DIR__) |> File.read!() |> Jason.decode!()
 
   test "executes the canonical fixture version and bucket boundaries" do
-    assert @fixture["version"] == 2
+    assert @fixture["version"] == 6
     assert is_binary(@fixture["description"])
 
     assert Enum.sort(Map.keys(@fixture)) ==
@@ -16,12 +16,17 @@ defmodule Featurevisor.ConformanceTest do
                "regularExpressions",
                "typedVariables",
                "datafile",
+               "globalVariables",
+               "requiredFeatures",
                "diagnostics",
                "numericBucketKeys",
                "portableConditions",
                "conditionCases",
                "childInstances",
                "defaults",
+               "modulePipeline",
+               "lifecycle",
+               "openFeature",
                "diagnosticCase",
                "nativeContexts"
              ])
@@ -57,6 +62,92 @@ defmodule Featurevisor.ConformanceTest do
                "feature"
              )
     end)
+  end
+
+  test "evaluates canonical global variables and required features" do
+    global = @fixture["globalVariables"]
+
+    Enum.each(global["cases"], fn item ->
+      f =
+        Featurevisor.create_featurevisor(%{
+          datafile: global["datafile"],
+          sticky_variables: item["stickyVariables"],
+          log_level: :fatal
+        })
+
+      options =
+        if Map.has_key?(item, "defaultVariableValue"),
+          do: %{default_variable_value: item["defaultVariableValue"]},
+          else: %{}
+
+      evaluation =
+        Featurevisor.evaluate_global_variable(f, item["key"], item["context"] || %{}, options)
+
+      assert Atom.to_string(evaluation.reason) == item["expectedReason"], item["name"]
+
+      if Map.has_key?(item, "expectedValue"),
+        do: assert(evaluation.variable_value == item["expectedValue"], item["name"]),
+        else: assert(is_nil(evaluation.variable_value), item["name"])
+
+      assert evaluation.variable_override_index == item["expectedOverrideIndex"], item["name"]
+      assert evaluation.variable_override_key == item["expectedOverrideKey"], item["name"]
+      assert evaluation.variable_override_path == item["expectedOverridePath"], item["name"]
+      Featurevisor.close(f)
+    end)
+
+    required = @fixture["requiredFeatures"]
+    f = Featurevisor.create_featurevisor(%{datafile: required["datafile"], log_level: :fatal})
+
+    Enum.each(required["cases"], fn item ->
+      assert Featurevisor.enabled?(f, item["feature"]) == item["expectedEnabled"], item["name"]
+    end)
+
+    item = required["featureVariableCase"]
+    evaluation = Featurevisor.evaluate_variable(f, item["feature"], item["variable"])
+    assert evaluation.variable_value == item["expectedValue"]
+    assert evaluation.variable_override_key == item["expectedOverrideKey"]
+    Featurevisor.close(f)
+  end
+
+  test "datafile events include global variables and dependency changes" do
+    item = @fixture["globalVariables"]["dependencyUpdateCase"]
+    parent = self()
+    f = Featurevisor.create_featurevisor(%{datafile: item["initial"], log_level: :fatal})
+    Featurevisor.on(f, :datafile_set, &send(parent, {:datafile, &1}))
+    assert :ok = Featurevisor.set_datafile(f, item["updated"], true)
+    assert_receive {:datafile, details}
+    assert Enum.sort(details.features) == Enum.sort(item["expectedChangedFeatures"])
+    assert Enum.sort(details.variables) == Enum.sort(item["expectedChangedVariables"])
+    Featurevisor.close(f)
+  end
+
+  test "global null values remain present ahead of caller defaults" do
+    datafile = %{
+      "schemaVersion" => "2",
+      "revision" => "nulls",
+      "segments" => %{},
+      "features" => %{},
+      "variables" => %{"nullable" => %{"type" => "object", "defaultValue" => nil}}
+    }
+
+    f =
+      Featurevisor.create_featurevisor(%{
+        datafile: datafile,
+        sticky_variables: %{"sticky" => nil},
+        log_level: :fatal
+      })
+
+    options = %{default_variable_value: "caller"}
+
+    assert Featurevisor.evaluate_global_variable(f, "nullable", %{}, options).variable_value ==
+             nil
+
+    assert Featurevisor.evaluate_global_variable(f, "sticky", %{}, options).variable_value == nil
+
+    assert Featurevisor.evaluate_global_variable(f, "missing", %{}, options).variable_value ==
+             "caller"
+
+    Featurevisor.close(f)
   end
 
   test "MurmurHash and bucketing match known JavaScript values" do
@@ -419,7 +510,7 @@ defmodule Featurevisor.ConformanceTest do
     f = Featurevisor.create_featurevisor(%{datafile: item["datafile"], log_level: :fatal})
 
     result =
-      Featurevisor.get_all_evaluations(f, %{}, [], %{
+      Featurevisor.get_feature_evaluations(f, %{}, [], %{
         default_variation_value: item["defaultVariationValue"]
       })
 

@@ -172,7 +172,8 @@ defmodule Featurevisor.CLI.TestRunner do
       Featurevisor.create_featurevisor(%{
         datafile: datafile,
         context: assertion["context"] || %{},
-        sticky: assertion["sticky"],
+        sticky_features: assertion["sticky"],
+        sticky_variables: assertion["stickyVariables"],
         log_level: log_level(options),
         modules: [module]
       })
@@ -205,6 +206,47 @@ defmodule Featurevisor.CLI.TestRunner do
     errors = compare_variables(errors, assertion, f, feature)
     errors = compare_evaluations(errors, assertion, f, feature)
     errors = compare_children(errors, assertion, f, feature)
+    Featurevisor.close(f)
+    errors
+  end
+
+  defp run_assertion(%{"variable" => variable}, assertion, datafiles, _segments, options) do
+    datafile =
+      datafiles[Project.datafile_key(assertion["environment"], assertion["target"])] ||
+        base_datafile(datafiles, assertion["environment"])
+
+    f =
+      Featurevisor.create_featurevisor(%{
+        datafile: datafile,
+        context: assertion["context"] || %{},
+        sticky_variables: assertion["stickyVariables"],
+        log_level: log_level(options)
+      })
+
+    evaluation_options =
+      if Map.has_key?(assertion, "defaultVariableValue"),
+        do: %{default_variable_value: assertion["defaultVariableValue"]},
+        else: %{}
+
+    evaluation = Featurevisor.evaluate_global_variable(f, variable, %{}, evaluation_options)
+
+    errors =
+      compare_present(
+        [],
+        assertion,
+        "expectedValue",
+        fn -> evaluation.variable_value end,
+        variable
+      )
+
+    errors =
+      compare_evaluation(
+        errors,
+        assertion["expectedEvaluation"],
+        wire(evaluation),
+        "#{variable}: variable"
+      )
+
     Featurevisor.close(f)
     errors
   end
@@ -292,7 +334,8 @@ defmodule Featurevisor.CLI.TestRunner do
     |> Enum.reduce(errors, fn {item, index}, current ->
       child =
         Featurevisor.spawn(f, item["context"] || %{}, %{
-          sticky: item["sticky"] || assertion["sticky"] || %{}
+          sticky_features: item["sticky"] || assertion["sticky"] || %{},
+          sticky_variables: item["stickyVariables"] || assertion["stickyVariables"] || %{}
         })
 
       current =
