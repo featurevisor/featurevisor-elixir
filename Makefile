@@ -35,4 +35,4 @@ escript:
 check: format-check compile test credo dialyzer docs package
 
 test-example-1: test escript
-	./featurevisor test --projectDirectoryPath=$(FEATUREVISOR_PROJECT) --target=all --target=checkout --onlyFailures
+	./featurevisor test --projectDirectoryPath=$(FEATUREVISOR_PROJECT) --onlyFailures

@@ -135,7 +135,14 @@ defmodule Featurevisor.CLI.TestRunner do
   defp compile_pattern(value), do: Regex.compile!(value, "i")
 
   defp run_assertion(%{"segment" => segment}, assertion, datafiles, segments, options) do
-    datafile = base_datafile(datafiles, assertion["environment"]) |> Map.put("segments", segments)
+    _ = datafiles
+
+    datafile = %{
+      "schemaVersion" => "2",
+      "revision" => "tester",
+      "segments" => segments,
+      "features" => %{}
+    }
 
     f =
       Featurevisor.create_featurevisor(%{
@@ -154,9 +161,27 @@ defmodule Featurevisor.CLI.TestRunner do
 
   defp run_assertion(%{"feature" => feature}, assertion, datafiles, _segments, options) do
     datafile =
-      datafiles[Project.datafile_key(assertion["environment"], assertion["target"])] ||
-        base_datafile(datafiles, assertion["environment"])
+      datafiles[Project.datafile_key(assertion["environment"], assertion["target"])]
 
+    if is_nil(datafile) do
+      [missing_datafile_message(assertion)]
+    else
+      run_feature_assertion(feature, assertion, datafile, options)
+    end
+  end
+
+  defp run_assertion(%{"variable" => variable}, assertion, datafiles, _segments, options) do
+    datafile =
+      datafiles[Project.datafile_key(assertion["environment"], assertion["target"])]
+
+    if is_nil(datafile) do
+      [missing_datafile_message(assertion)]
+    else
+      run_variable_assertion(variable, assertion, datafile, options)
+    end
+  end
+
+  defp run_feature_assertion(feature, assertion, datafile, options) do
     if options.show_datafile, do: IO.puts(Jason.encode!(datafile, pretty: true))
 
     module = %Module{
@@ -172,55 +197,65 @@ defmodule Featurevisor.CLI.TestRunner do
       Featurevisor.create_featurevisor(%{
         datafile: datafile,
         context: assertion["context"] || %{},
-        sticky_features: assertion["sticky"],
+        sticky_features: assertion["stickyFeatures"] || assertion["sticky"],
         sticky_variables: assertion["stickyVariables"],
         log_level: log_level(options),
         modules: [module]
       })
 
-    errors = []
+    try do
+      errors =
+        compare_present(
+          [],
+          assertion,
+          "expectedToBeEnabled",
+          fn -> Featurevisor.enabled?(f, feature) end,
+          feature
+        )
 
-    errors =
-      compare_present(
-        errors,
-        assertion,
-        "expectedToBeEnabled",
-        fn -> Featurevisor.enabled?(f, feature) end,
-        feature
-      )
+      variation_options =
+        if Map.has_key?(assertion, "defaultVariationValue"),
+          do: %{default_variation_value: assertion["defaultVariationValue"]},
+          else: %{}
 
-    variation_options =
-      if Map.has_key?(assertion, "defaultVariationValue"),
-        do: %{default_variation_value: assertion["defaultVariationValue"]},
-        else: %{}
+      errors =
+        compare_present(
+          errors,
+          assertion,
+          "expectedVariation",
+          fn -> Featurevisor.get_variation(f, feature, %{}, variation_options) end,
+          feature
+        )
 
-    errors =
-      compare_present(
-        errors,
-        assertion,
-        "expectedVariation",
-        fn -> Featurevisor.get_variation(f, feature, %{}, variation_options) end,
-        feature
-      )
-
-    errors = compare_variables(errors, assertion, f, feature)
-    errors = compare_evaluations(errors, assertion, f, feature)
-    errors = compare_children(errors, assertion, f, feature)
-    Featurevisor.close(f)
-    errors
+      errors
+      |> compare_variables(assertion, f, feature)
+      |> compare_evaluations(assertion, f, feature)
+      |> compare_children(assertion, f, feature)
+    after
+      Featurevisor.close(f)
+    end
   end
 
-  defp run_assertion(%{"variable" => variable}, assertion, datafiles, _segments, options) do
-    datafile =
-      datafiles[Project.datafile_key(assertion["environment"], assertion["target"])] ||
-        base_datafile(datafiles, assertion["environment"])
+  defp run_variable_assertion(variable, assertion, datafile, options) do
+    if options.show_datafile, do: IO.puts(Jason.encode!(datafile, pretty: true))
+
+    module = %Module{
+      name: "tester",
+      bucket_value: fn value ->
+        if is_number(assertion["at"]),
+          do: trunc(assertion["at"] * 1_000),
+          else: value.bucket_value
+      end
+    }
 
     f =
       Featurevisor.create_featurevisor(%{
         datafile: datafile,
         context: assertion["context"] || %{},
+        sticky_features: assertion["stickyFeatures"],
         sticky_variables: assertion["stickyVariables"],
-        log_level: log_level(options)
+        log_level: log_level(options),
+        modules: [module]
       })
 
     evaluation_options =
@@ -228,27 +263,75 @@ defmodule Featurevisor.CLI.TestRunner do
         do: %{default_variable_value: assertion["defaultVariableValue"]},
         else: %{}
 
-    evaluation = Featurevisor.evaluate_global_variable(f, variable, %{}, evaluation_options)
+    try do
+      evaluation = Featurevisor.evaluate_global_variable(f, variable, %{}, evaluation_options)
 
-    errors =
-      compare_present(
-        [],
-        assertion,
-        "expectedValue",
-        fn -> evaluation.variable_value end,
-        variable
-      )
+      errors =
+        compare_present(
+          [],
+          assertion,
+          "expectedValue",
+          fn -> evaluation.variable_value end,
+          variable
+        )
 
-    errors =
-      compare_evaluation(
-        errors,
-        assertion["expectedEvaluation"],
-        wire(evaluation),
-        "#{variable}: variable"
-      )
+      errors =
+        compare_evaluation(
+          errors,
+          assertion["expectedEvaluation"],
+          wire(evaluation),
+          "#{variable}: variable"
+        )
 
-    Featurevisor.close(f)
-    errors
+      compare_variable_children(errors, assertion, f, variable)
+    after
+      Featurevisor.close(f)
+    end
+  end
+
+  defp compare_variable_children(errors, assertion, f, variable) do
+    Enum.with_index(assertion["children"] || [])
+    |> Enum.reduce(errors, fn {item, index}, current ->
+      child =
+        Featurevisor.spawn(f, item["context"] || %{}, %{
+          sticky_features: item["stickyFeatures"] || %{},
+          sticky_variables: item["stickyVariables"] || %{}
+        })
+
+      options =
+        if Map.has_key?(item, "defaultVariableValue"),
+          do: %{default_variable_value: item["defaultVariableValue"]},
+          else: %{}
+
+      evaluation = Featurevisor.Child.evaluate_global_variable(child, variable, %{}, options)
+      prefix = "#{variable}: children[#{index}]"
+
+      try do
+        current =
+          compare_present(
+            current,
+            item,
+            "expectedValue",
+            fn -> evaluation.variable_value end,
+            prefix
+          )
+
+        compare_evaluation(
+          current,
+          item["expectedEvaluation"],
+          wire(evaluation),
+          "#{prefix}.expectedEvaluation"
+        )
+      after
+        Featurevisor.Child.close(child)
+      end
+    end)
+  end
+
+  defp missing_datafile_message(assertion) do
+    environment = assertion["environment"] || "none"
+    target = if assertion["target"], do: " and target \"#{assertion["target"]}\"", else: ""
+    "datafile not found for environment \"#{environment}\"#{target}"
   end
 
   defp compare_present(errors, assertion, key, actual, feature) do
@@ -376,13 +459,6 @@ defmodule Featurevisor.CLI.TestRunner do
 
   defp wire(%Evaluation{} = evaluation),
     do: evaluation |> Evaluation.to_map() |> Jason.encode!() |> Jason.decode!()
-
-  defp base_datafile(datafiles, environment),
-    do:
-      datafiles[Project.datafile_key(environment, nil)] ||
-        Enum.find_value(datafiles, fn {key, value} ->
-          if not String.contains?(key, "-target-"), do: value
-        end)
 
   defp log_level(%{verbose: true}), do: :debug
   defp log_level(%{quiet: true}), do: :fatal
