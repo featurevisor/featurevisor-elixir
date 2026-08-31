@@ -47,6 +47,44 @@ jobs:
           mix docs --warnings-as-errors
           mix hex.build
 
+  openfeature:
+    name: OpenFeature with Elixir ${{ matrix.elixir }} and OTP ${{ matrix.otp }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - elixir: "1.15.8"
+            otp: "26.2"
+          - elixir: "1.20.3"
+            otp: "29.0"
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: erlef/setup-beam@v1.24.1
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+      - name: Install provider dependencies
+        working-directory: openfeature
+        run: FEATUREVISOR_OPENFEATURE_PATH=.. mix deps.get
+      - name: Compile provider without warnings
+        working-directory: openfeature
+        run: FEATUREVISOR_OPENFEATURE_PATH=.. mix compile --warnings-as-errors
+      - name: Test provider
+        working-directory: openfeature
+        run: FEATUREVISOR_OPENFEATURE_PATH=.. mix test
+      - name: Format, static analysis, documentation, and package
+        if: matrix.elixir == '1.20.3'
+        working-directory: openfeature
+        run: |
+          mix format --check-formatted
+          FEATUREVISOR_OPENFEATURE_PATH=.. mix credo --strict
+          FEATUREVISOR_OPENFEATURE_PATH=.. mix dialyzer
+          FEATUREVISOR_OPENFEATURE_PATH=.. mix docs --warnings-as-errors
+          env -u FEATUREVISOR_OPENFEATURE_PATH mix hex.build
+
   example:
     name: Featurevisor example 1
     runs-on: ubuntu-latest

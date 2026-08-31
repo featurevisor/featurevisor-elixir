@@ -35,6 +35,7 @@ The SDK supports concurrent evaluations, structured diagnostics, lifecycle modul
 - [Modules](#modules)
 - [Child instance](#child-instance)
 - [Close](#close)
+- [OpenFeature](#openfeature)
 - [CLI usage](#cli-usage)
   - [Test](#test)
   - [Benchmark](#benchmark)
@@ -52,7 +53,7 @@ Add `featurevisor` to your dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:featurevisor, "~> 1.0"}
+    {:featurevisor, "~> 1.2"}
   ]
 end
 ```
@@ -446,6 +447,78 @@ Close invokes module close callbacks and removes listeners, diagnostic subscript
 
 Do not call `close/1` directly for a supervised instance. Stop its supervisor or remove its child instead. A closed handle evaluates against an empty datafile, so flags return `false`, variations and variables return `nil`, and the revision returns `"unknown"`.
 
+## OpenFeature
+
+The OpenFeature provider is published as a separate Hex package. Applications
+that only use the Featurevisor SDK do not install or compile OpenFeature or the
+provider code.
+
+```elixir
+def deps do
+  [
+    {:featurevisor, "~> 1.2"},
+    {:featurevisor_openfeature, "~> 1.2"},
+    {:open_feature, "~> 0.1.3"}
+  ]
+end
+```
+
+Create a provider that owns its Featurevisor instance:
+
+```elixir
+provider =
+  FeaturevisorOpenFeature.Provider.new(
+    featurevisor_options: %{datafile: datafile}
+  )
+
+{:ok, provider} = OpenFeature.set_provider(provider)
+client = OpenFeature.get_client()
+
+enabled =
+  OpenFeature.Client.get_boolean_value(client, "checkout", false,
+    context: %{"targetingKey" => "user-123"}
+  )
+```
+
+You can also pass an existing Featurevisor instance. The provider borrows it
+and does not close it:
+
+```elixir
+provider = FeaturevisorOpenFeature.Provider.new(featurevisor: f)
+```
+
+OpenFeature uses one flag key while Featurevisor supports flags, variations,
+feature variables, and global variables:
+
+| OpenFeature key | Featurevisor evaluation |
+| --- | --- |
+| `checkout` | Flag for feature `checkout` |
+| `checkout:variation` | Variation for feature `checkout` |
+| `checkout:title` | Variable `title` inside feature `checkout` |
+| `variable:supportEmail` | Global variable `supportEmail` |
+
+`targeting_key_field`, `key_separator`, `variation_key`, and
+`global_variable_prefix` customize this mapping. The targeting key maps to
+`userId` by default. The global variable prefix defaults to `variable` and
+cannot contain the separator.
+
+The official OpenFeature Elixir SDK represents evaluation context as a map. The
+provider accepts `"targetingKey"`, `"targeting_key"`, or `:targeting_key` and
+copies its string value to the configured Featurevisor targeting field.
+
+The provider implements boolean, string, number, and map resolution.
+Featurevisor evaluation reasons, variation values, revision, schema version,
+rule keys, bucket information, and override information are mapped to
+OpenFeature resolution details and flag metadata. Missing definitions, type
+mismatches, and invalid datafiles use standard OpenFeature errors. Replacing an
+invalid datafile with a valid one recovers the provider.
+
+The OpenFeature Elixir SDK does not currently expose provider tracking.
+Featurevisor modules and diagnostics continue to run inside the Featurevisor
+instance.
+
+See the [OpenFeature provider guide](https://featurevisor.com/docs/sdks/openfeature/) for the shared key convention and providers for other languages.
+
 ## CLI usage
 
 Build the escript from this repository:
@@ -522,7 +595,7 @@ make test-example-1
 
 The integration target executes all expanded `example-1` assertions, including Target datafiles, through the Elixir evaluator.
 
-`make check` remains the fast package gate. The separate `make test-example-1` target requires the sibling Featurevisor monorepo, so checks and publishing workflows run that integration explicitly after the package gate.
+`make check` verifies both the base SDK and OpenFeature provider. The separate `make test-example-1` target requires the sibling Featurevisor monorepo, so checks and publishing workflows run that integration explicitly after the package gate.
 
 ## Publishing
 
@@ -533,7 +606,11 @@ make check
 mix hex.publish --dry-run
 ```
 
-The release workflow verifies the tag, package contents, documentation, and `example-1` integration before publishing to Hex.pm.
+The repository publishes `featurevisor` and `featurevisor_openfeature` with the same version. The release workflow verifies the tag, package contents, documentation, and `example-1` integration, then publishes the base package before the provider package.
+
+Hex can only resolve the provider's exact base package dependency after the
+matching `featurevisor` release is visible. The workflow waits for that release
+before it performs the final provider dry run and publication.
 
 The published Hex package intentionally includes runtime source, `mix.exs`, the README, and the licence. Tests and the conformance fixture remain repository verification assets and are not shipped to consumers.
 

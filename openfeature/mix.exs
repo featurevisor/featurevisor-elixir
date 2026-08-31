@@ -1,4 +1,4 @@
-defmodule Featurevisor.MixProject do
+defmodule FeaturevisorOpenFeature.MixProject do
   use Mix.Project
 
   @version "1.2.0"
@@ -6,22 +6,16 @@ defmodule Featurevisor.MixProject do
 
   def project do
     [
-      app: :featurevisor,
+      app: :featurevisor_openfeature,
       version: @version,
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
-      description: "Featurevisor SDK for Elixir",
+      description: "OpenFeature provider for the Featurevisor Elixir SDK",
       package: package(),
       docs: docs(),
-      escript: [main_module: Featurevisor.CLI],
-      test_coverage: [tool: ExCoveralls],
-      elixirc_paths: elixirc_paths(Mix.env())
+      test_coverage: [tool: ExCoveralls]
     ]
-  end
-
-  def cli do
-    [preferred_envs: [coveralls: :test, "coveralls.html": :test]]
   end
 
   def application do
@@ -30,7 +24,8 @@ defmodule Featurevisor.MixProject do
 
   defp deps do
     [
-      {:jason, "~> 1.4"},
+      featurevisor_dependency(),
+      {:open_feature, "~> 0.1.3"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false},
       {:ex_doc, "~> 0.38", only: :dev, runtime: false},
@@ -38,8 +33,12 @@ defmodule Featurevisor.MixProject do
     ]
   end
 
-  defp elixirc_paths(:test), do: ["lib", "test/support"]
-  defp elixirc_paths(_), do: ["lib"]
+  defp featurevisor_dependency do
+    case System.get_env("FEATUREVISOR_OPENFEATURE_PATH") do
+      nil -> {:featurevisor, "== #{@version}"}
+      path -> {:featurevisor, "== #{@version}", path: path}
+    end
+  end
 
   defp package do
     [

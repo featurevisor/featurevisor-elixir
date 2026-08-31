@@ -24,9 +24,17 @@ jobs:
           node-version: 24
           package-manager-cache: false
       - name: Install dependencies
-        run: mix deps.get
-      - name: Verify tag matches package version
-        run: test "${GITHUB_REF_NAME#v}" = "$(mix run --no-start --no-compile -e 'IO.write(Mix.Project.config()[:version])')"
+        run: |
+          mix deps.get
+          cd openfeature
+          FEATUREVISOR_OPENFEATURE_PATH=.. mix deps.get
+      - name: Verify tag matches package versions
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          base_version=$(mix run --no-start --no-compile -e 'IO.write(Mix.Project.config()[:version])')
+          provider_version=$(cd openfeature && FEATUREVISOR_OPENFEATURE_PATH=.. mix run --no-start --no-compile -e 'IO.write(Mix.Project.config()[:version])')
+          test "$version" = "$base_version"
+          test "$base_version" = "$provider_version"
       - name: Run checks
         run: make check
       - name: Set up Featurevisor example 1 project
@@ -48,7 +56,50 @@ jobs:
           tar -tf featurevisor-*.tar | grep '^contents.tar.gz$'
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
-      - name: Publish to Hex.pm
-        run: mix hex.publish --yes
+      - name: Publish base package to Hex.pm
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if curl --fail --silent --show-error "https://hex.pm/api/packages/featurevisor/releases/$version" >/dev/null; then
+            echo "featurevisor $version is already published"
+          else
+            mix hex.publish --yes
+          fi
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+      - name: Wait for base package
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          for attempt in {1..18}; do
+            if curl --fail --silent --show-error "https://hex.pm/api/packages/featurevisor/releases/$version" >/dev/null; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "featurevisor $version did not become available on Hex.pm" >&2
+          exit 1
+      - name: Publish OpenFeature provider package to Hex.pm
+        shell: bash
+        working-directory: openfeature
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if curl --fail --silent --show-error "https://hex.pm/api/packages/featurevisor_openfeature/releases/$version" >/dev/null; then
+            echo "featurevisor_openfeature $version is already published"
+          else
+            resolved=false
+            for attempt in {1..18}; do
+              if env -u FEATUREVISOR_OPENFEATURE_PATH mix deps.get; then
+                resolved=true
+                break
+              fi
+              sleep 10
+            done
+            test "$resolved" = true
+            env -u FEATUREVISOR_OPENFEATURE_PATH mix hex.publish --dry-run --yes
+            env -u FEATUREVISOR_OPENFEATURE_PATH mix hex.build
+            tar -tf featurevisor_openfeature-*.tar | grep '^contents.tar.gz$'
+            env -u FEATUREVISOR_OPENFEATURE_PATH mix hex.publish --yes
+          fi
         env:
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
