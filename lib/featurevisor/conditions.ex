@@ -390,17 +390,19 @@ defmodule Featurevisor.Conditions do
     end
   end
 
-  defp bounded_date(value) do
+  # The year is checked first. Before Elixir 1.17, converting a year beyond 9999 raises.
+  defp bounded_date(%DateTime{year: year} = value) when year >= 1 and year <= 9999 do
     milliseconds = DateTime.to_unix(value, :millisecond)
 
-    if value.year >= 1 and value.year <= 9999 and
-         abs(value.utc_offset + value.std_offset) <= 14 * 3600 and
+    if abs(value.utc_offset + value.std_offset) <= 14 * 3600 and
          milliseconds >= -62_135_596_800_000 and milliseconds <= 253_402_300_799_999 do
       {:ok, DateTime.truncate(value, :millisecond)}
     else
       :error
     end
   end
+
+  defp bounded_date(_value), do: :error
 
   defp semver(left, right, predicate) when is_binary(left) and is_binary(right) do
     case Semver.compare(left, right) do

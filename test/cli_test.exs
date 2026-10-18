@@ -1080,14 +1080,30 @@ defmodule Featurevisor.CLITest do
       {c_locale_output, c_locale_status} =
         run_cli_process(
           directory,
-          [{"LC_ALL", "C"}, {"LC_CTYPE", "C"}, {"LANG", "C"}, {"FAKE_MODE", "fail"} | base_env],
+          [
+            # Linux gives the VM latin1 file names in a C locale and macOS never does.
+            # Forcing it tests the same thing everywhere.
+            {"ELIXIR_ERL_OPTIONS", "+fnl"},
+            {"LC_ALL", "C"},
+            {"LC_CTYPE", "C"},
+            {"LANG", "C"},
+            {"FAKE_MODE", "fail"}
+            | base_env
+          ],
           ["--json"]
         )
 
       assert c_locale_status == 1, c_locale_output
 
+      # The VM running mix warns about latin1 file names on stderr, which is merged here.
       c_locale_report =
-        c_locale_output |> String.split("\n", trim: true) |> hd() |> Jason.decode!()
+        c_locale_output
+        |> String.split("\n", trim: true)
+        |> Enum.reject(
+          &String.starts_with?(&1, "warning: the VM is running with native name encoding")
+        )
+        |> hd()
+        |> Jason.decode!()
 
       assert c_locale_report == failed_report
 
