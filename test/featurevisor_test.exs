@@ -47,7 +47,7 @@ defmodule FeaturevisorTest do
   end
 
   test "merges and replaces datafiles", %{f: f} do
-    assert :ok =
+    assert true ==
              Featurevisor.set_datafile(f, %{
                "schemaVersion" => "2",
                "revision" => "next",
@@ -61,7 +61,7 @@ defmodule FeaturevisorTest do
     assert Featurevisor.get_feature(f, "extra")
     assert Featurevisor.get_revision(f) == "next"
 
-    assert :ok =
+    assert true ==
              Featurevisor.set_datafile(
                f,
                Jason.encode!(%{
@@ -83,7 +83,7 @@ defmodule FeaturevisorTest do
       send(parent, {:error, diagnostic})
     end)
 
-    assert {:error, _} = Featurevisor.set_datafile(f, "{")
+    assert false == Featurevisor.set_datafile(f, "{")
     assert Featurevisor.get_revision(f) == "test"
     assert_receive {:error, %{message: "Could not parse datafile", code: "invalid_datafile"}}
   end
@@ -143,7 +143,7 @@ defmodule FeaturevisorTest do
     refute Process.alive?(f.pid)
     assert :ets.info(f.table) == :undefined
 
-    assert Featurevisor.set_datafile(f, Featurevisor.TestFixtures.datafile(), true) == :ok
+    assert Featurevisor.set_datafile(f, Featurevisor.TestFixtures.datafile(), true) == false
     assert Featurevisor.set_context(f, %{"country" => "nl"}) == :ok
     assert Featurevisor.set_sticky_features(f, %{"flag" => %{"enabled" => true}}) == :ok
     assert Featurevisor.set_log_level(f, :debug) == :ok

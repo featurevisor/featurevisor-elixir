@@ -5,7 +5,7 @@ defmodule Featurevisor.ConformanceTest do
   @fixture Path.expand("../conformance/sdk-v3.json", __DIR__) |> File.read!() |> Jason.decode!()
 
   test "executes the canonical fixture version and bucket boundaries" do
-    assert @fixture["version"] == 6
+    assert @fixture["version"] == 15
     assert is_binary(@fixture["description"])
 
     assert Enum.sort(Map.keys(@fixture)) ==
@@ -18,6 +18,9 @@ defmodule Featurevisor.ConformanceTest do
                "datafile",
                "globalVariables",
                "requiredFeatures",
+               "requiredFeatureGroups",
+               "requiredFeatureGroupInputs",
+               "requiredVariables",
                "diagnostics",
                "numericBucketKeys",
                "portableConditions",
@@ -109,12 +112,55 @@ defmodule Featurevisor.ConformanceTest do
     Featurevisor.close(f)
   end
 
+  test "verifies every canonical prerequisite evaluation detail" do
+    %{"requiredFeatures" => %{"evaluationCases" => [_ | _] = cases} = required} = @fixture
+    assert length(cases) == 9
+
+    Enum.each(cases, fn item ->
+      f = Featurevisor.create_featurevisor(%{datafile: required["datafile"], log_level: :fatal})
+      on_exit(fn -> Featurevisor.close(f) end)
+
+      for _ <- 1..2 do
+        context = Map.get(item, "context", %{})
+
+        evaluation =
+          case Map.fetch!(item, "type") do
+            "flag" ->
+              Featurevisor.evaluate_flag(f, Map.fetch!(item, "feature"), context)
+
+            "variation" ->
+              Featurevisor.evaluate_variation(f, Map.fetch!(item, "feature"), context)
+
+            "variable" ->
+              if Map.has_key?(item, "feature") do
+                Featurevisor.evaluate_variable(
+                  f,
+                  Map.fetch!(item, "feature"),
+                  Map.fetch!(item, "variable"),
+                  context
+                )
+              else
+                Featurevisor.evaluate_global_variable(f, Map.fetch!(item, "variable"), context)
+              end
+          end
+
+        actual =
+          evaluation |> Featurevisor.Evaluation.to_map() |> Jason.encode!() |> Jason.decode!()
+
+        Enum.each(Map.fetch!(item, "expected"), fn {field, expected} ->
+          assert Map.has_key?(actual, field), item["name"]
+          assert actual[field] == expected, "#{item["name"]}: #{field}"
+        end)
+      end
+    end)
+  end
+
   test "datafile events include global variables and dependency changes" do
     item = @fixture["globalVariables"]["dependencyUpdateCase"]
     parent = self()
     f = Featurevisor.create_featurevisor(%{datafile: item["initial"], log_level: :fatal})
     Featurevisor.on(f, :datafile_set, &send(parent, {:datafile, &1}))
-    assert :ok = Featurevisor.set_datafile(f, item["updated"], true)
+    assert true == Featurevisor.set_datafile(f, item["updated"], true)
     assert_receive {:datafile, details}
     assert Enum.sort(details.features) == Enum.sort(item["expectedChangedFeatures"])
     assert Enum.sort(details.variables) == Enum.sort(item["expectedChangedVariables"])
@@ -175,6 +221,13 @@ defmodule Featurevisor.ConformanceTest do
   test "executes every generic condition case" do
     cache = :ets.new(:condition_cases, [:set, :public, write_concurrency: true])
     report = fn _ -> :ok end
+
+    assert length(@fixture["conditionCases"]) == 189
+
+    assert Enum.count(
+             @fixture["conditionCases"],
+             &String.contains?(&1["name"], ["includesAny", "IncludesAny"])
+           ) == 73
 
     Enum.each(@fixture["conditionCases"], fn item ->
       assert Conditions.all_conditions?(item["condition"], item["context"], cache, report) ==
@@ -325,9 +378,14 @@ defmodule Featurevisor.ConformanceTest do
 
       value =
         case item["type"] do
-          "integer" -> Featurevisor.get_variable_integer(f, "feature", "value")
-          "double" -> Featurevisor.get_variable_double(f, "feature", "value")
-          "boolean" -> Featurevisor.get_variable_boolean(f, "feature", "value")
+          "integer" ->
+            Featurevisor.get_variable_integer(f, "feature", "value")
+
+          type when type in ["number", "double"] ->
+            Featurevisor.get_variable_number(f, "feature", "value")
+
+          "boolean" ->
+            Featurevisor.get_variable_boolean(f, "feature", "value")
         end
 
       assert not is_nil(value) == item["valid"]

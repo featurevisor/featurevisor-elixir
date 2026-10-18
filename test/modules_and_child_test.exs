@@ -23,10 +23,12 @@ defmodule Featurevisor.ModulesAndChildTest do
 
         api.report_diagnostic.(%{level: :info, code: "ready", message: "ready", details: %{}})
       end,
-      before: fn options -> %{options | context: Map.put(options.context, "country", "nl")} end,
+      before_evaluation: fn options ->
+        %{options | context: Map.put(options.context, "country", "nl")}
+      end,
       bucket_key: fn options -> options.bucket_key <> ".module" end,
       bucket_value: fn _ -> 75_000 end,
-      after: fn evaluation, _ -> evaluation end,
+      after_evaluation: fn evaluation, _ -> evaluation end,
       close: fn -> send(parent, :closed) end
     }
 
@@ -51,20 +53,12 @@ defmodule Featurevisor.ModulesAndChildTest do
       Enum.map(["first", "second"], fn name ->
         %Module{
           name: name,
-          before: fn options ->
-            send(parent, "before:#{name}")
-            options
-          end,
           before_evaluation: fn options ->
             send(parent, "beforeEvaluation:#{name}")
             options
           end,
           after_evaluation: fn evaluation, _ ->
             send(parent, "afterEvaluation:#{name}")
-            evaluation
-          end,
-          after: fn evaluation, _ ->
-            send(parent, "after:#{name}")
             evaluation
           end
         }
@@ -79,17 +73,15 @@ defmodule Featurevisor.ModulesAndChildTest do
 
     Featurevisor.enabled?(f, "flag", %{"userId" => "1"})
 
-    assert_receive "before:first"
-    assert_receive "before:second"
     assert_receive "beforeEvaluation:first"
     assert_receive "beforeEvaluation:second"
     assert_receive "afterEvaluation:first"
     assert_receive "afterEvaluation:second"
-    assert_receive "after:first"
-    assert_receive "after:second"
   end
 
   test "required feature evaluations use modules" do
+    parent = self()
+
     datafile = %{
       "schemaVersion" => "2",
       "revision" => "required",
@@ -121,10 +113,31 @@ defmodule Featurevisor.ModulesAndChildTest do
       Featurevisor.create_featurevisor(%{
         datafile: datafile,
         modules: [module],
-        log_level: :fatal
+        log_level: :debug,
+        on_diagnostic: fn diagnostic -> send(parent, {:prerequisite, diagnostic}) end
       })
 
     refute Featurevisor.enabled?(f, "dependent")
+    evaluation = Featurevisor.evaluate_flag(f, "dependent")
+    assert evaluation.reason == :conditions_unmet
+    assert evaluation.enabled == false
+    assert evaluation.conditions == [%{"feature" => "enabled"}]
+
+    wire = evaluation |> Featurevisor.Evaluation.to_map() |> Jason.encode!() |> Jason.decode!()
+    assert wire["reason"] == "conditions_unmet"
+    assert wire["conditions"] == [%{"feature" => "enabled"}]
+
+    assert_receive {:prerequisite,
+                    %{
+                      code: "conditions_unmet",
+                      details: %{
+                        reason: "conditions_unmet",
+                        evaluation: %{"reason" => :conditions_unmet}
+                      }
+                    }}
+
+    refute_receive {:prerequisite, %{code: "required"}}
+    Featurevisor.close(f)
   end
 
   test "explicit null feature variable beats the caller default" do
@@ -213,7 +226,9 @@ defmodule Featurevisor.ModulesAndChildTest do
       "schemaVersion" => "2",
       "revision" => "global",
       "segments" => %{},
-      "features" => %{},
+      "features" => %{
+        "disabled" => %{"bucketBy" => "userId", "traffic" => []}
+      },
       "variables" => %{
         "message" => %{
           "type" => "string",
@@ -240,6 +255,7 @@ defmodule Featurevisor.ModulesAndChildTest do
     f =
       Featurevisor.create_featurevisor(%{
         datafile: datafile,
+        sticky_features: %{"disabled" => %{"enabled" => true}},
         sticky_variables: %{"message" => "parent"},
         modules: [module],
         log_level: :fatal
@@ -252,9 +268,54 @@ defmodule Featurevisor.ModulesAndChildTest do
     assert Featurevisor.Child.get_global_variable(plain, "message") == "after"
 
     Featurevisor.remove_module(f, "global")
+    assert Featurevisor.enabled?(f, "disabled")
+    refute Featurevisor.Child.enabled?(plain, "disabled")
     assert Featurevisor.get_global_variable(f, "message") == "parent"
     assert Featurevisor.Child.get_global_variable(child, "message") == "child"
     assert Featurevisor.Child.get_global_variable(plain, "message") == "default"
+    Featurevisor.close(f)
+  end
+
+  test "required features treat a source module error as disabled" do
+    datafile = %{
+      "schemaVersion" => "2",
+      "revision" => "module-error-requirement",
+      "segments" => %{},
+      "features" => %{
+        "source" => %{
+          "bucketBy" => "userId",
+          "traffic" => [%{"key" => "all", "segments" => "*", "percentage" => 100_000}]
+        },
+        "explicitFalse" => %{
+          "bucketBy" => "userId",
+          "requiredFeatures" => [%{"feature" => "source", "enabled" => false}],
+          "traffic" => [%{"key" => "all", "segments" => "*", "percentage" => 100_000}]
+        },
+        "negated" => %{
+          "bucketBy" => "userId",
+          "requiredFeatures" => %{"not" => ["source"]},
+          "traffic" => [%{"key" => "all", "segments" => "*", "percentage" => 100_000}]
+        }
+      }
+    }
+
+    module = %Module{
+      name: "source-error",
+      before_evaluation: fn options ->
+        if options.feature_key == "source", do: raise("source failed"), else: options
+      end
+    }
+
+    f =
+      Featurevisor.create_featurevisor(%{
+        datafile: datafile,
+        modules: [module],
+        log_level: :fatal
+      })
+
+    refute Featurevisor.enabled?(f, "source")
+    assert Featurevisor.enabled?(f, "explicitFalse")
+    assert Featurevisor.enabled?(f, "negated")
     Featurevisor.close(f)
   end
 

@@ -54,7 +54,14 @@ defmodule Featurevisor.EventsAndConcurrencyTest do
     options = %{
       name: name,
       datafile: Featurevisor.TestFixtures.datafile(),
-      log_level: :fatal,
+      log_level: :info,
+      on_diagnostic: fn
+        %{code: "sdk_initialized"} ->
+          send(parent, {:sdk_initialized, Featurevisor.instance(name).pid})
+
+        _ ->
+          :ok
+      end,
       modules: [%Module{name: "lifecycle", close: fn -> send(parent, :module_closed) end}]
     }
 
@@ -62,11 +69,17 @@ defmodule Featurevisor.EventsAndConcurrencyTest do
     {:ok, supervisor} = Supervisor.start_link([{Featurevisor, options}], strategy: :one_for_one)
 
     f = Featurevisor.instance(name)
+    first_pid = f.pid
+    assert_receive {:sdk_initialized, ^first_pid}, 5_000
     assert Featurevisor.enabled?(f, "flag", %{"country" => "nl"})
 
-    first_pid = f.pid
+    monitor = Process.monitor(first_pid)
     Process.exit(first_pid, :kill)
-    restarted_pid = wait_for_restart(name, first_pid, 50)
+    assert_receive {:DOWN, ^monitor, :process, ^first_pid, :killed}, 5_000
+
+    # Name registration precedes datafile loading in the child start callback.
+    # Wait for SDK initialization rather than treating a new PID as ready.
+    assert_receive {:sdk_initialized, restarted_pid}, 5_000
     assert restarted_pid != first_pid
 
     restarted = Featurevisor.instance(name)
@@ -74,23 +87,10 @@ defmodule Featurevisor.EventsAndConcurrencyTest do
     assert Featurevisor.enabled?(restarted, "flag", %{"country" => "nl"})
 
     Supervisor.stop(supervisor)
-    assert_receive :module_closed
+    assert_receive :module_closed, 5_000
 
     assert_raise ArgumentError, "Featurevisor instance is not running", fn ->
       Featurevisor.instance(name)
-    end
-  end
-
-  defp wait_for_restart(_name, _previous, 0), do: flunk("Featurevisor child did not restart")
-
-  defp wait_for_restart(name, previous, attempts) do
-    case GenServer.whereis(name) do
-      pid when is_pid(pid) and pid != previous ->
-        pid
-
-      _ ->
-        Process.sleep(10)
-        wait_for_restart(name, previous, attempts - 1)
     end
   end
 end

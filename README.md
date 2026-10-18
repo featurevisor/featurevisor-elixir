@@ -1,16 +1,16 @@
 # Featurevisor SDK for Elixir <!-- omit in toc -->
 
-This is the official [Featurevisor](https://featurevisor.com) SDK for Elixir. It evaluates feature flags, variations, and variables in Elixir applications using Featurevisor schema version 2 datafiles.
+Use the Featurevisor Elixir SDK to evaluate flags, variations and variables in Elixir applications. It consumes Featurevisor schema version 4 datafiles and retains compatibility with legacy schema version 2 datafiles.
 
 The SDK supports concurrent evaluations, structured diagnostics, lifecycle modules, child instances, and the Featurevisor project test runner.
 
 ## Table of contents <!-- omit in toc -->
 
 - [Installation](#installation)
-- [Public API](#public-api)
 - [Initialization](#initialization)
+  - [Public API](#public-api)
 - [Supervision](#supervision)
-- [Evaluation types](#evaluation-types)
+  - [Evaluation types](#evaluation-types)
 - [Context](#context)
   - [Setting initial context](#setting-initial-context)
   - [Setting after initialization](#setting-after-initialization)
@@ -18,8 +18,12 @@ The SDK supports concurrent evaluations, structured diagnostics, lifecycle modul
 - [Check if enabled](#check-if-enabled)
 - [Getting variation](#getting-variation)
 - [Getting variables](#getting-variables)
+  - [Getting feature variables](#getting-feature-variables)
+  - [Getting global variables](#getting-global-variables)
   - [Type specific getters](#type-specific-getters)
-- [Getting all evaluations](#getting-all-evaluations)
+- [Conditions](#conditions)
+- [Composed variables](#composed-variables)
+- [Getting evaluations](#getting-evaluations)
 - [Sticky](#sticky)
   - [Setting initial sticky values](#setting-initial-sticky-values)
   - [Updating sticky values](#updating-sticky-values)
@@ -40,6 +44,7 @@ The SDK supports concurrent evaluations, structured diagnostics, lifecycle modul
   - [Test](#test)
   - [Benchmark](#benchmark)
   - [Assess distribution](#assess-distribution)
+- [GitHub repositories](#github-repositories)
 - [Development](#development)
 - [Publishing](#publishing)
 - [License](#license)
@@ -48,12 +53,14 @@ The SDK supports concurrent evaluations, structured diagnostics, lifecycle modul
 
 ## Installation
 
+Upgrading an existing application? Follow the [Elixir migration guide](https://featurevisor.com/docs/migrations/v4/elixir/).
+
 Add `featurevisor` to your dependencies in `mix.exs`:
 
 ```elixir
 def deps do
   [
-    {:featurevisor, "~> 1.2"}
+    {:featurevisor, "~> 2.0"}
   ]
 end
 ```
@@ -64,7 +71,38 @@ Then install dependencies:
 mix deps.get
 ```
 
-## Public API
+## Initialization
+
+Initialize with a decoded datafile:
+
+```elixir
+datafile =
+  "featurevisor-all.json"
+  |> File.read!()
+  |> Jason.decode!()
+
+f = Featurevisor.create_featurevisor(%{datafile: datafile})
+
+try do
+  IO.puts(Featurevisor.enabled?(f, "checkout", %{"userId" => "123"}))
+after
+  Featurevisor.close(f)
+end
+```
+
+File read and JSON parsing errors raise before initialization. This example closes the instance after evaluation.
+
+Create one long lived instance for your application and share it between processes. The convenience constructor is not linked to the calling process, so its owner must call `Featurevisor.close/1` during application shutdown.
+
+You may pass the JSON string directly:
+
+```elixir
+f = Featurevisor.create_featurevisor(%{datafile: File.read!("featurevisor-all.json")})
+```
+
+Invalid datafiles do not replace the active datafile. They report an `invalid_datafile` diagnostic with the stable message `Could not parse datafile`.
+
+### Public API
 
 Create instances with `Featurevisor.create_featurevisor/1`. The returned `Featurevisor` handle is the main SDK instance.
 
@@ -80,30 +118,7 @@ Most applications use:
 - `Featurevisor.Diagnostic` for observability
 - `Featurevisor.Evaluation` for detailed results
 
-The datafile and context use ordinary Elixir maps with string keys. This preserves the JSON wire format and avoids a second public reader API.
-
-## Initialization
-
-Initialize with a decoded datafile:
-
-```elixir
-datafile =
-  "datafile.json"
-  |> File.read!()
-  |> Jason.decode!()
-
-f = Featurevisor.create_featurevisor(%{datafile: datafile})
-```
-
-Create one long lived instance for your application and share it between processes. Evaluation reads immutable ETS snapshots and does not queue through the instance process. The convenience constructor is not linked to the calling process, so its owner must call `Featurevisor.close/1` during application shutdown.
-
-You may pass the JSON string directly:
-
-```elixir
-f = Featurevisor.create_featurevisor(%{datafile: File.read!("datafile.json")})
-```
-
-Invalid datafiles do not replace the active datafile. They report an `invalid_datafile` diagnostic with the stable message `Could not parse datafile`.
+The datafile and context use Elixir maps with string keys. This preserves the JSON wire format and avoids a second public reader API.
 
 ## Supervision
 
@@ -124,25 +139,29 @@ Resolve its Featurevisor handle wherever it is needed:
 
 ```elixir
 f = Featurevisor.instance(MyApp.Featurevisor)
-Featurevisor.enabled?(f, "my_feature", %{"userId" => "123"})
+Featurevisor.enabled?(f, "checkout", %{"userId" => "123"})
 ```
 
-The supervisor owns shutdown and restart. Module close callbacks run during supervised shutdown. Resolve the handle again after a restart because the new owner process creates new ETS tables.
+The supervisor owns shutdown and restart. Module close callbacks run during supervised shutdown. Resolve the handle again after a restart to use the new instance.
 
-## Evaluation types
+### Evaluation types
 
 Featurevisor evaluates four kinds of values:
 
-- a flag answers whether a feature is enabled
-- a variation returns a variation value
-- a feature variable returns remote configuration owned by a feature
-- a global variable returns remote configuration independently of a feature
+- [**Flag**](#check-if-enabled) (`boolean()`): whether the feature is enabled or not
+- [**Variation**](#getting-variation) (`String.t()`): the variation of the feature (if any)
+- [**Feature variable**](#getting-feature-variables): a configuration value owned by a feature
+- [**Global variable**](#getting-global-variables): a configuration value evaluated independently of a feature
 
 Every evaluation uses the active datafile and the effective context.
 
 ## Context
 
 Contexts are maps of attributes used by conditions and bucketing. Use string keys so nested paths and datafile attribute names match exactly.
+
+Conditions compare these attributes using the [operators](https://featurevisor.com/docs/operators/), including `empty` and `notEmpty`.
+
+Date comparisons accept portable timestamp strings and `DateTime` values, not `Date` or `NaiveDateTime`. Offsets must stay within 14 hours and both local and UTC years within 0001 to 9999. Fractions are truncated to milliseconds. Invalid values make both `before` and `after` return `false`.
 
 Date conditions accept ISO 8601 strings with an explicit time zone and native `DateTime` values.
 
@@ -169,7 +188,7 @@ Featurevisor.set_context(f, %{"device" => "mobile"})
 Pass `true` to replace all stored context:
 
 ```elixir
-Featurevisor.set_context(f, %{"userId" => "456"}, true)
+Featurevisor.set_context(f, %{"userId" => "456"}, true) # replace
 ```
 
 ### Passing context for one evaluation
@@ -177,9 +196,9 @@ Featurevisor.set_context(f, %{"userId" => "456"}, true)
 ```elixir
 context = %{"country" => "de"}
 
-Featurevisor.enabled?(f, "my_feature", context)
-Featurevisor.get_variation(f, "my_feature", context)
-Featurevisor.get_variable(f, "my_feature", "title", context)
+Featurevisor.enabled?(f, "checkout", context)
+Featurevisor.get_variation(f, "checkout", context)
+Featurevisor.get_variable(f, "checkout", "title", context)
 ```
 
 Evaluation context wins over stored context for matching keys.
@@ -187,7 +206,7 @@ Evaluation context wins over stored context for matching keys.
 ## Check if enabled
 
 ```elixir
-if Featurevisor.enabled?(f, "my_feature", %{"userId" => "123"}) do
+if Featurevisor.enabled?(f, "checkout", %{"userId" => "123"}) do
   # show the enabled experience
 end
 ```
@@ -204,7 +223,7 @@ case Featurevisor.get_variation(f, "checkout_experiment", context) do
 end
 ```
 
-Provide an explicit fallback when no variation is selected:
+Provide a fallback when no variation is selected:
 
 ```elixir
 Featurevisor.get_variation(
@@ -217,18 +236,26 @@ Featurevisor.get_variation(
 
 ## Getting variables
 
+### Getting feature variables
+
 ```elixir
 title = Featurevisor.get_variable(f, "checkout", "title", context)
 ```
 
 JSON variables are decoded before they are returned.
 
-Global variables use explicit function names so feature ownership remains clear:
+### Getting global variables
+
+Global variables use separate function names so feature ownership remains clear:
 
 ```elixir
 email = Featurevisor.get_global_variable(f, "supportEmail", context)
 evaluation = Featurevisor.evaluate_global_variable(f, "supportEmail", context)
 ```
+
+Overrides and conditions are applied for you. See [Variables](https://featurevisor.com/docs/variables/#global-variables) and [Conditions](https://featurevisor.com/docs/conditions/) for how to define them. To see which overrides changed a value, read `variable_override_paths` from `evaluate_global_variable/3`.
+
+Modules should return the same result for the same input during one evaluation. Pass values that change through context.
 
 ### Type specific getters
 
@@ -238,7 +265,7 @@ Use a typed getter when your application wants runtime type validation:
 enabled = Featurevisor.get_variable_boolean(f, "checkout", "enabled", context)
 title = Featurevisor.get_variable_string(f, "checkout", "title", context)
 count = Featurevisor.get_variable_integer(f, "checkout", "count", context)
-ratio = Featurevisor.get_variable_double(f, "checkout", "ratio", context)
+ratio = Featurevisor.get_variable_number(f, "checkout", "ratio", context)
 items = Featurevisor.get_variable_array(f, "checkout", "items", context)
 config = Featurevisor.get_variable_object(f, "checkout", "config", context)
 json = Featurevisor.get_variable_json(f, "checkout", "json", context)
@@ -246,7 +273,53 @@ json = Featurevisor.get_variable_json(f, "checkout", "json", context)
 
 Typed getters return `nil` for a mismatched value and do not coerce strings, booleans, or collections.
 
-## Getting all evaluations
+`get_variable_number/5` and `get_global_variable_number/4` read a variable of type `number`, whether it holds `3` or `4.5`. Datafiles built before v4 call that type `double`, and it reads the same way. The v3 names `get_variable_double/5` and `get_global_variable_double/4` were removed in v4.
+
+## Conditions
+
+[Conditions](https://featurevisor.com/docs/conditions/) provide one expression grammar for segments, feature and global variable root gates, force entries, traffic rules and variable overrides. Leaves compare an attribute, name a segment, check a feature or compare a global or feature variable. A bare string is a segment key. Feature checks default to enabled. Variable comparisons may include a compiled path array, with the variable key treated literally.
+
+Arrays imply AND. Logical groups use `and`, `or` and `not`. NOT negates the AND of its direct children. Empty new arrays and groups do not match. Evaluation preserves expression order and short circuits. The builder compiles authored paths and stringified selectors for SDK consumption.
+
+Sticky state wins first. Feature force entries precede root conditions. Otherwise roots must match before traffic rules. Global variable roots run before sources and overrides. An unmet root returns `:conditions_unmet` with `evaluation.conditions`. Disabled variations and feature variables keep their ordinary fallback reasons and values.
+
+Condition dependencies use ordinary getters, modules, effective context and sticky state without inheriting the outer getter's explicit defaults. Missing values and explicit null remain distinct during path comparisons. Cycles and more than 256 combined internal handoffs fail the complete evaluation, and the next public call starts a fresh session.
+
+## Composed variables
+
+[Composed variables](https://featurevisor.com/docs/variables/#compose-values) read other values at runtime. A string composition is an alias of a literal global variable key. A map composition collects feature enabled state, variations, feature variables and global variables under literal property names.
+
+For example, a generated datafile may contain:
+
+```elixir
+variables = %{
+  "policy" => %{"type" => "object", "defaultValue" => %{"limit" => 50}},
+  "policyAlias" => %{"type" => "object", "compose" => "policy"},
+  "screen" => %{
+    "type" => "object",
+    "compose" => [
+      %{"key" => "enabled", "feature" => "checkout"},
+      %{"key" => "policy", "variable" => "policyAlias"},
+      %{"key" => "variation", "feature" => "checkout", "variation" => true}
+    ]
+  }
+}
+```
+
+Use the familiar getters after loading the datafile:
+
+```elixir
+Featurevisor.get_global_variable(f, "policyAlias", context)
+Featurevisor.get_global_variable_object(f, "screen", context)
+```
+
+An alias returns its source value directly, preserving false, zero, empty strings, arrays and null. JSON sources decode exactly once, even if their decoded value resembles JSON text. Map composition creates an outer map without flattening member values. Elixir values are immutable, and runtime mutations cannot change a source, sibling property or sticky value.
+
+Compositions have no `defaultValue` or `useDefaultWhenDisabled`. Optional root conditions can return `disabledValue`, otherwise null, without reading sources or overrides. Whole variable sticky state bypasses assembly. All sources are read before an override program runs. Nested compositions and overrides use the same getter pipeline and mutation interpreter as ordinary variables.
+
+Detailed results use `:variable_composed`, or `:variable_override_rule` when an override matches. Ordinary missing or failed source getters retain their normal false or null fallback. Dependency cycles and depth errors fail the whole composition.
+
+## Getting evaluations
 
 ```elixir
 features = Featurevisor.get_feature_evaluations(f, context)
@@ -261,6 +334,8 @@ variables = Featurevisor.get_global_variable_evaluations(f, context, ["supportEm
 ```
 
 ## Sticky
+
+Treat sticky values supplied at creation or through setters as read only inputs. Use a setter to change sticky state. Returned evaluation values can be used independently.
 
 Sticky values keep selected evaluations stable for the lifetime of an instance or child instance.
 
@@ -285,7 +360,7 @@ f = Featurevisor.create_featurevisor(%{
 ```elixir
 Featurevisor.set_sticky_features(f, sticky_features)
 Featurevisor.set_sticky_variables(f, sticky_variables)
-Featurevisor.set_sticky_features(f, replacement, true)
+Featurevisor.set_sticky_features(f, replacement, true) # replace
 ```
 
 Sticky values are instance state. They are not accepted as public per evaluation options.
@@ -294,12 +369,16 @@ Sticky values are instance state. They are not accepted as public per evaluation
 
 `set_datafile/3` accepts a decoded map or JSON string.
 
+It returns `true` when the datafile is accepted, including when its revision and contents are unchanged. It returns `false` when the input is rejected or the instance is closed. Accepted input still emits `:datafile_set`, even when unchanged. Diagnostic and event callback failures do not change the return value.
+
+Invalid input retains the last valid datafile and reports the existing error diagnostic without emitting `:datafile_set`. The return value is a boolean, not `:ok` or `{:error, reason}`. Read `diagnostic.original_error` through your diagnostic callback or the `:error` event when you need the rejection reason. Closed instances do not emit diagnostics or events for attempted updates.
+
 ### Merging by default
 
-Incoming features, global variables, and segments are merged into the stored datafile. Incoming entries replace entries with the same key.
+Incoming features, global variables, and segments are merged into the stored datafile. Incoming entries replace entries with the same key. Legacy schema version 2 selectors normalize eagerly before merging, without changing the supplied map. Schema version 4 entities normalize lazily on their first read. Informational schema version metadata is retained. A partial update invalidates incoming entity caches only. Complete replacement clears them all.
 
 ```elixir
-Featurevisor.set_datafile(f, next_datafile)
+accepted = Featurevisor.set_datafile(f, next_datafile)
 ```
 
 ### Replacing
@@ -307,7 +386,7 @@ Featurevisor.set_datafile(f, next_datafile)
 Pass `true` to replace the complete datafile:
 
 ```elixir
-Featurevisor.set_datafile(f, next_datafile, true)
+accepted = Featurevisor.set_datafile(f, next_datafile, true) # replace
 ```
 
 ### Loading datafiles
@@ -340,6 +419,8 @@ f = Featurevisor.create_featurevisor(%{
 
 Every `Featurevisor.Diagnostic` contains `level`, `code`, `message`, and an always present `details` map. Error diagnostics also emit the `:error` event.
 
+Malformed stringified selector JSON fails that complete selector, including through negated segment aliases, without rejecting the accepted datafile or affecting unrelated entities. A broken root reports `:conditions_unmet`. The error level `conditions_parse_error` diagnostic appears once per malformed selector per incoming entity load: during schema version 2 setting, after accepted storage, or on the first schema version 4 entity read, after caching. Its details contain exactly `conditions`, `entityType` and `entityKey`. There is no location field. Diagnostic callbacks can safely reenter getters.
+
 Featurevisor project linting enforces the portable regular expression subset shared by all SDKs. The Elixir runtime treats the `g` flag as a compatibility no op. Invalid patterns or flags produce a `condition_match_error` diagnostic and do not match.
 
 ## Events
@@ -362,7 +443,7 @@ Supported events are:
 - `:sticky_variables_set`
 - `:error`
 
-The `:datafile_set` details include changed `features` and `variables`, including dependants affected by changed required features or segments.
+The `:datafile_set` details include changed `features` and `variables`, including dependants affected by changed feature, variable and segment conditions or composition sources. Additions and removals propagate through transitive mixed dependencies.
 
 ## Evaluation details
 
@@ -375,9 +456,13 @@ variable = Featurevisor.evaluate_variable(f, "checkout", "title", context)
 global_variable = Featurevisor.evaluate_global_variable(f, "supportEmail", context)
 ```
 
-Each method returns a `Featurevisor.Evaluation` struct.
+Each method returns a `Featurevisor.Evaluation` struct. Common fields include `type`, `reason`, entity keys, `conditions`, selected rule and force metadata, value and schema metadata, and matched override keys, paths and indexes. Accumulation includes `variable_override_paths`. Unmet root conditions use `:conditions_unmet`. Successful compositions use `:variable_composed`. Use `Featurevisor.Evaluation.to_map/1` for camelCase wire field names.
 
 ## Modules
+
+The before evaluation and after evaluation phases each use the module membership at the start of that phase. Where an evaluation uses bucketing, the bucket key and bucket value phases each use their own starting membership. Adding or removing a module during a phase does not change the iteration already in progress. The next phase uses the membership then installed. A module added before the after phase can receive after callbacks for evaluations already in progress, even if it did not receive their before callbacks. A module removed before the after phase receives no after callback.
+
+Module options expose `dependency_of` on internal reads. It identifies the immediate requesting evaluation with `type`, optional `feature_key` and optional `variable_key`. `dependency_purpose` is `:condition` or `:composition`. Independent application calls have neither marker and never receive private session state. Memoization is local to a public call and separates purposes, requester identities, context and current instance state.
 
 Modules extend evaluation and lifecycle behaviour without changing evaluation methods.
 
@@ -405,9 +490,7 @@ remove = Featurevisor.add_module(f, module)
 remove.()
 ```
 
-Module callbacks are `setup`, `before`, `before_evaluation`, `bucket_key`, `bucket_value`, `after_evaluation`, `after`, and `close`. For feature evaluations, all `before` callbacks run in registration order, followed by all `before_evaluation` callbacks. After evaluation and caller defaults, all `after_evaluation` callbacks run, followed by all `after` callbacks. Global variable evaluations use only `before_evaluation` and `after_evaluation`. Required feature checks run through the complete module pipeline, and transformed defaults are preserved. Callback option maps use idiomatic snake case keys such as `bucket_key` and `bucket_value`.
-
-`before` and `after` remain available as deprecated feature-only compatibility callbacks. Use `before_evaluation` and `after_evaluation` for new modules so the same callbacks can handle feature and global variable evaluations.
+Module callbacks are `setup`, `before_evaluation`, `bucket_key`, `bucket_value`, `after_evaluation`, and `close`. Evaluation callbacks run in registration order and surround the complete evaluation once, including accumulating global override programs. Condition dependencies and composition sources use the same module pipeline. Callback option maps use idiomatic snake case keys such as `bucket_key` and `bucket_value`.
 
 Named duplicates are rejected with a `duplicate_module` diagnostic. A failed setup is removed, its diagnostic subscriptions are cleared, and its close callback is invoked.
 
@@ -445,19 +528,19 @@ Featurevisor.close(f)
 
 Close invokes module close callbacks and removes listeners, diagnostic subscriptions, and caches. Calling close more than once is safe.
 
+An evaluation already in progress can finish using its retained datafile. Its resources are released when it finishes.
+
 Do not call `close/1` directly for a supervised instance. Stop its supervisor or remove its child instead. A closed handle evaluates against an empty datafile, so flags return `false`, variations and variables return `nil`, and the revision returns `"unknown"`.
 
 ## OpenFeature
 
-The OpenFeature provider is published as a separate Hex package. Applications
-that only use the Featurevisor SDK do not install or compile OpenFeature or the
-provider code.
+The OpenFeature provider is published as a separate Hex package. Applications that only use the Featurevisor SDK do not install or compile OpenFeature or the provider code.
 
 ```elixir
 def deps do
   [
-    {:featurevisor, "~> 1.2"},
-    {:featurevisor_openfeature, "~> 1.2"},
+    {:featurevisor, "~> 2.0"},
+    {:featurevisor_openfeature, "~> 2.0"},
     {:open_feature, "~> 0.1.3"}
   ]
 end
@@ -480,15 +563,13 @@ enabled =
   )
 ```
 
-You can also pass an existing Featurevisor instance. The provider borrows it
-and does not close it:
+Pass an existing Featurevisor instance for the provider to borrow. The provider does not close it:
 
 ```elixir
 provider = FeaturevisorOpenFeature.Provider.new(featurevisor: f)
 ```
 
-OpenFeature uses one flag key while Featurevisor supports flags, variations,
-feature variables, and global variables:
+OpenFeature uses one flag key while Featurevisor supports flags, variations, feature variables, and global variables:
 
 | OpenFeature key | Featurevisor evaluation |
 | --- | --- |
@@ -497,86 +578,100 @@ feature variables, and global variables:
 | `checkout:title` | Variable `title` inside feature `checkout` |
 | `variable:supportEmail` | Global variable `supportEmail` |
 
-`targeting_key_field`, `key_separator`, `variation_key`, and
-`global_variable_prefix` customize this mapping. The targeting key maps to
-`userId` by default. The global variable prefix defaults to `variable` and
-cannot contain the separator.
+`targeting_key_field`, `key_separator`, `variation_key`, and `global_variable_prefix` customize this mapping. The targeting key maps to `userId` by default. The global variable prefix defaults to `variable` and cannot contain the separator.
 
-The official OpenFeature Elixir SDK represents evaluation context as a map. The
-provider accepts `"targetingKey"`, `"targeting_key"`, or `:targeting_key` and
-copies its string value to the configured Featurevisor targeting field.
+The official OpenFeature Elixir SDK represents evaluation context as a map. The provider accepts `"targetingKey"`, `"targeting_key"`, or `:targeting_key` and copies its string value to the configured Featurevisor targeting field.
 
-The provider implements boolean, string, number, and map resolution.
-Featurevisor evaluation reasons, variation values, revision, schema version,
-rule keys, bucket information, and override information are mapped to
-OpenFeature resolution details and flag metadata. Missing definitions, type
-mismatches, and invalid datafiles use standard OpenFeature errors. Replacing an
-invalid datafile with a valid one recovers the provider.
+The provider implements boolean, string, number, and map resolution. Root `conditions_unmet` maps to OpenFeature `DISABLED`. Compositions and matched overrides map to `TARGETING_MATCH`. Composed values are already evaluated and are not JSON decoded again. Featurevisor evaluation reasons, variation values, revision, schema version, rule keys, bucket information, and override information are mapped to OpenFeature resolution details and flag metadata. Missing definitions, type mismatches, and invalid datafiles use standard OpenFeature errors. Replacing an invalid datafile with a valid one recovers the provider.
 
-The OpenFeature Elixir SDK does not currently expose provider tracking.
-Featurevisor modules and diagnostics continue to run inside the Featurevisor
-instance.
+The OpenFeature Elixir SDK does not currently expose provider tracking. Featurevisor modules and diagnostics continue to run inside the Featurevisor instance.
+
+An invalid initial datafile makes provider initialization return `{:error, :parse_error}`, independently of `log_level`. A valid update restores evaluation health. Initialize or register the provider again after a failed registration. Shutdown removes provider subscriptions and closes only an owned instance.
 
 See the [OpenFeature provider guide](https://featurevisor.com/docs/sdks/openfeature/) for the shared key convention and providers for other languages.
 
 ## CLI usage
 
-Build the escript from this repository:
+Build the escript from this SDK repository:
 
-```sh
+```bash
+mix deps.get
 mix escript.build
 ```
 
-The Elixir runner delegates project parsing, Target discovery, matrix expansion, and datafile generation to `npx featurevisor`. Evaluations and assertions run through this Elixir SDK.
+The native test runner requires `@featurevisor/cli` 4.0.0 or later and Node.js 24 or later. Install the Node.js CLI in your Featurevisor project:
+
+```bash
+npm install --save-dev @featurevisor/cli@^4.0.0
+```
+
+Project parsing, test definitions, execution protocol, matrix expansion and datafile generation use `npx featurevisor`. Evaluations run through this Elixir SDK. Use the Node.js CLI directly for authoring commands. This native CLI provides only test, benchmark and distribution commands. The SDK runtime has no Node.js dependency.
+
+Options use kebab case, such as `--project-directory-path`. The camelCase forms from earlier releases still work, and `--root-directory-path` is an alias for `--project-directory-path`. Pass values as `--name=value` or `--name value`. Repeat `--target` to select several targets in order. Run `<command> --help` to list every option.
+
+Duplicate targets are evaluated once, at their first position.
 
 ### Test
 
-```sh
+```bash
 ./featurevisor test \
-  --projectDirectoryPath=../featurevisor/examples/example-1 \
-  --onlyFailures
+  --project-directory-path=/path/to/featurevisor-project \
+  --only-failures
 ```
 
-Use one or more Targets when required:
+See [Testing](https://featurevisor.com/docs/testing/) for authoring specs and [Checks](https://featurevisor.com/docs/testing/#checks) for check syntax and operators.
 
-```sh
-./featurevisor test \
-  --projectDirectoryPath=../featurevisor/examples/example-1 \
-  --target=all \
-  --target=checkout
-```
+Useful test options:
+
+- `--key-pattern=<pattern>` and `--assertion-pattern=<pattern>` filter tests.
+- `--entity-type=scenario` selects scenarios. `--set=<set>` selects one project set. Omitting `--set` runs all sets.
+- `--case=<id>` reruns one expanded case. Copy the opaque ID or rerun command from a failure report.
+- `--json --pretty` produces an indented JSON report.
+- `--coverage` reports observed rule and override selections. `--uncovered` lists features and global variables without associated specs.
+- `--only-failures`, `--quiet`, `--verbose` and `--show-datafile` control diagnostic output.
+
+Segment owners and checks evaluate through ordinary SDK gates with the selected environment, Target, fixed bucket, effective context and sticky state. Selected compiled Target segments remain authoritative. The execution protocol restores missing definitions from its compiled transitive `_segments` map. Attribute only segment chains can run without an environment, while dependent segments require the selected datafile. Check references are preflighted transitively before any getter runs. Synthetic segment helper features are excluded from coverage.
+
+Linting remains a separate authoring step. The native `test` command does not automatically run `lint`.
+
+Printed rerun commands use POSIX shell quoting. JSON reports also include raw argument arrays.
 
 ### Benchmark
 
-```sh
+The examples below use a project without environments. Add `--environment=<name>` if your project configures environments. In a sets project, omit `--set` to run every set or pass `--set=<name>`. Repeat `--target=<key>` to evaluate specific target datafiles. The Node.js CLI validates these options and builds the datafiles. Elixir evaluates them. Replace `checkout` with a feature defined in your project.
+
+```bash
 ./featurevisor benchmark \
-  --projectDirectoryPath=../featurevisor/examples/example-1 \
-  --environment=production \
-  --feature=allowSignup \
-  --variation \
+  --project-directory-path=/path/to/featurevisor-project \
+  --feature=checkout \
   --context='{"country":"nl"}' \
-  --n=1000000
+  --n=1000
 ```
 
-Benchmark output reports total duration and the minimum, average, and maximum duration of individual evaluations.
-
-Pass `--variable=supportEmail` without `--feature` to benchmark a global variable.
+Use `--variation` for a variation or `--variable=<key>` for a feature variable. Omit `--feature` to benchmark a global variable. Do not combine `--variation` with `--variable`. See [Benchmarking](https://featurevisor.com/docs/cli/#benchmarking).
 
 ### Assess distribution
 
-```sh
+```bash
 ./featurevisor assess-distribution \
-  --projectDirectoryPath=../featurevisor/examples/example-1 \
-  --environment=production \
-  --feature=allowSignup \
-  --context='{"country":"nl"}' \
-  --populateUuid=userId \
-  --n=10000
+  --project-directory-path=/path/to/featurevisor-project \
+  --feature=checkout \
+  --populate-uuid=userId \
+  --n=1000
 ```
 
-Repeat `--target` and `--populateUuid` where needed.
+Repeat `--populate-uuid=<key>` or `--populate-uuid <key>` to generate UUID values for multiple context attributes. Add `--verbose` to print generated contexts. Both measurement commands accept `--n=1000`, `--n 1000`, `-n=1000` and `-n 1000`. Counts must be positive integers. Quote JSON context and paths containing spaces as one shell argument. See [Assess distribution](https://featurevisor.com/docs/cli/#assess-distribution).
+
+## GitHub repositories
+
+- SDK: [featurevisor/featurevisor-elixir](https://github.com/featurevisor/featurevisor-elixir)
+- Example application: [featurevisor/featurevisor-example-elixir](https://github.com/featurevisor/featurevisor-example-elixir)
 
 <!-- FEATUREVISOR_DOCS_END -->
+
+<a id="getting-all-evaluations"></a>
+
+The aggregate evaluation reference has moved to [Getting evaluations](#getting-evaluations).
 
 ## Development
 
@@ -593,9 +688,11 @@ Run the SDK against the sibling Featurevisor example project:
 make test-example-1
 ```
 
-The integration target executes all expanded `example-1` assertions, including Target datafiles, through the Elixir evaluator.
+The native tests cover runtime conformance and project integration.
 
-`make check` verifies both the base SDK and OpenFeature provider. The separate `make test-example-1` target requires the sibling Featurevisor monorepo, so checks and publishing workflows run that integration explicitly after the package gate.
+Run `mix test test/readme_initialization_test.exs` to execute the actual initialization snippet with an isolated local datafile. The check covers evaluation, cleanup and failures, and also runs in the ordinary SDK suite and CI.
+
+`make check` verifies both the base SDK and OpenFeature provider. The separate `make test-example-1` target requires the sibling Featurevisor monorepo, so checks and publishing workflows run that integration after the package gate.
 
 ## Publishing
 
@@ -608,11 +705,9 @@ mix hex.publish --dry-run
 
 The repository publishes `featurevisor` and `featurevisor_openfeature` with the same version. The release workflow verifies the tag, package contents, documentation, and `example-1` integration, then publishes the base package before the provider package.
 
-Hex can only resolve the provider's exact base package dependency after the
-matching `featurevisor` release is visible. The workflow waits for that release
-before it performs the final provider dry run and publication.
+Hex can only resolve the provider's exact base package dependency after the matching `featurevisor` release is visible. The workflow waits for that release before it performs the final provider dry run and publication.
 
-The published Hex package intentionally includes runtime source, `mix.exs`, the README, and the licence. Tests and the conformance fixture remain repository verification assets and are not shipped to consumers.
+The published Hex package includes runtime source, tests, both canonical conformance fixtures, `mix.exs`, the README, and the licence so its source distribution can run the same verification.
 
 ## License
 

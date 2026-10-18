@@ -3,10 +3,20 @@ defmodule Featurevisor do
   Feature flags, experiments, and remote configuration for Elixir.
 
   Create an isolated instance with `create_featurevisor/1`, then evaluate flags,
-  variations, and variables against a Featurevisor schema version 2 datafile.
+  variations, and variables against a Featurevisor schema version 4 or legacy schema version 2 datafile.
   """
 
-  alias Featurevisor.{Conditions, Diagnostic, Evaluator, Module, Server}
+  alias Featurevisor.{
+    Conditions,
+    Diagnostic,
+    EvaluationSession,
+    Evaluator,
+    Module,
+    Mutations,
+    Server,
+    StickyStore
+  }
+
   require Logger
 
   @opaque t :: %__MODULE__{pid: pid(), table: :ets.tid()}
@@ -79,25 +89,22 @@ defmodule Featurevisor do
     }
   end
 
-  @doc "Merges or replaces the stored datafile."
-  @spec set_datafile(t(), map() | String.t(), boolean()) :: :ok | {:error, term()}
+  @doc """
+  Merges or replaces the stored datafile.
+
+  Returns true when accepted, including unchanged input, or false when rejected or closed.
+  """
+  @spec set_datafile(t(), map() | String.t(), boolean()) :: boolean()
   def set_datafile(instance, input, replace \\ false) do
-    if open?(instance), do: set_live_datafile(instance, input, replace), else: :ok
+    if open?(instance), do: set_live_datafile(instance, input, replace), else: false
   end
 
   defp set_live_datafile(instance, input, replace) do
     with {:ok, datafile} <- Server.parse_datafile(input),
-         true <- Server.valid_datafile?(datafile) do
-      details =
-        Server.update(instance.pid, fn snapshot ->
-          stored =
-            if replace, do: datafile, else: Server.merge_datafile(snapshot.datafile, datafile)
-
-          :ets.delete_all_objects(snapshot.regex_cache)
-
-          {Server.datafile_details(snapshot.datafile, stored, replace),
-           %{snapshot | datafile: stored}}
-        end)
+         true <- Server.valid_datafile?(datafile),
+         {datafile, errors} <- Featurevisor.Normalize.datafile(datafile),
+         {:ok, details} <- store_datafile(instance, datafile, replace) do
+      Enum.each(errors, &report(instance, &1))
 
       report(instance, %{
         level: :info,
@@ -107,8 +114,11 @@ defmodule Featurevisor do
       })
 
       trigger(instance, :datafile_set, details)
-      :ok
+      true
     else
+      :closed ->
+        false
+
       error ->
         reason =
           if match?({:error, _}, error),
@@ -123,8 +133,15 @@ defmodule Featurevisor do
           details: %{}
         })
 
-        {:error, reason}
+        false
     end
+  end
+
+  defp store_datafile(instance, datafile, replace) do
+    Server.set_datafile(instance.pid, datafile, replace)
+  catch
+    :exit, reason ->
+      if open?(instance), do: exit(reason), else: :closed
   end
 
   @doc "Merges or replaces the stored context."
@@ -225,27 +242,52 @@ defmodule Featurevisor do
   @doc "Returns the informational datafile schema version."
   def get_schema_version(instance), do: snapshot(instance).datafile["schemaVersion"]
   @doc "Returns a feature definition."
-  def get_feature(instance, key), do: get_in(snapshot(instance).datafile, ["features", key])
-  @doc "Returns a segment definition."
-  def get_segment(instance, key) do
-    case get_in(snapshot(instance).datafile, ["segments", key]) do
-      nil ->
-        nil
+  def get_feature(instance, key),
+    do:
+      Server.with_snapshot(instance.table, fn snap ->
+        Featurevisor.Normalize.get(
+          snap.datafile,
+          "features",
+          key,
+          snap.regex_cache,
+          reporter(instance)
+        )
+        |> Featurevisor.Normalize.public()
+      end)
 
-      segment ->
-        Map.update!(segment, "conditions", &Conditions.parse_conditions(&1, reporter(instance)))
-    end
-  end
+  @doc "Returns a segment definition."
+  def get_segment(instance, key),
+    do:
+      Server.with_snapshot(instance.table, fn snap ->
+        Featurevisor.Normalize.get(
+          snap.datafile,
+          "segments",
+          key,
+          snap.regex_cache,
+          reporter(instance)
+        )
+        |> Featurevisor.Normalize.public()
+      end)
 
   @doc "Returns all feature keys. Ordering is not guaranteed."
-  def get_feature_keys(instance), do: Map.keys(snapshot(instance).datafile["features"])
+  def get_feature_keys(instance),
+    do:
+      Server.with_snapshot(
+        instance.table,
+        &Featurevisor.EntityCollection.keys(&1.datafile["features"])
+      )
+
   @doc "Returns variable keys for a feature."
   def get_variable_keys(instance, key),
     do: instance |> get_feature(key) |> then(&Map.keys((&1 && &1["variablesSchema"]) || %{}))
 
   @doc "Returns all global variable keys. Ordering is not guaranteed."
   def get_global_variable_keys(instance),
-    do: Map.keys(snapshot(instance).datafile["variables"] || %{})
+    do:
+      Server.with_snapshot(
+        instance.table,
+        &Featurevisor.EntityCollection.keys(&1.datafile["variables"] || %{})
+      )
 
   @doc "Returns whether a feature defines variations."
   def has_variations?(instance, key),
@@ -278,7 +320,8 @@ defmodule Featurevisor do
     evaluation = evaluate_variable(instance, feature_key, variable_key, context, options)
     value = evaluation.variable_value
 
-    if get_in(evaluation.variable_schema || %{}, ["type"]) == "json" and is_binary(value) do
+    if not evaluation.__getter_value_normalized and
+         get_in(evaluation.variable_schema || %{}, ["type"]) == "json" and is_binary(value) do
       case Jason.decode(value) do
         {:ok, parsed} ->
           parsed
@@ -311,9 +354,9 @@ defmodule Featurevisor do
   def get_variable_integer(instance, feature, variable, context \\ %{}, options \\ %{}),
     do: typed(get_variable(instance, feature, variable, context, options), :integer)
 
-  @doc "Returns a finite numeric variable after runtime type checking."
-  def get_variable_double(instance, feature, variable, context \\ %{}, options \\ %{}),
-    do: typed(get_variable(instance, feature, variable, context, options), :double)
+  @doc "Returns a finite number variable, whole or fractional, after runtime type checking."
+  def get_variable_number(instance, feature, variable, context \\ %{}, options \\ %{}),
+    do: typed(get_variable(instance, feature, variable, context, options), :number)
 
   @doc "Returns a list variable after runtime type checking."
   def get_variable_array(instance, feature, variable, context \\ %{}, options \\ %{}),
@@ -329,169 +372,269 @@ defmodule Featurevisor do
 
   @doc "Evaluates a global variable and returns details."
   def evaluate_global_variable(instance, variable_key, context \\ %{}, options \\ %{}) do
-    snap = snapshot(instance)
+    Server.with_snapshot(instance.table, fn snap ->
+      evaluate_global_snapshot(instance, snap, variable_key, context, options)
+    end)
+  end
+
+  defp evaluate_global_snapshot(instance, snap, variable_key, context, options) do
     options = normalize_options(options)
+    options = evaluation_sources(instance, options)
 
-    evaluation_options = %{
-      type: :variable,
-      variable_key: variable_key,
-      context: Map.merge(snap.context, context),
-      default_variable_present: Map.has_key?(options, :default_variable_value),
-      default_variable_value: Map.get(options, :default_variable_value)
-    }
+    with_request_session(options, fn options ->
+      Server.seed_request_cache(instance.table, snap)
+      session = options.__session
 
-    try do
+      evaluation_options = %{
+        type: :variable,
+        variable_key: variable_key,
+        dependency_purpose: options[:__dependency_purpose],
+        context: effective_context(snap, context, options),
+        default_variable_present: Map.has_key?(options, :default_variable_value),
+        default_variable_value: Map.get(options, :default_variable_value)
+      }
+
       evaluation_options =
-        Enum.reduce(snap.modules, evaluation_options, fn module, current ->
-          if module.before_evaluation, do: module.before_evaluation.(current), else: current
-        end)
+        if snap.modules == [] do
+          evaluation_options
+        else
+          Map.merge(evaluation_options, %{
+            sticky_features: StickyStore.materialize(options.__sticky_features_source.()),
+            sticky_variables: StickyStore.materialize(options.__sticky_variables_source.())
+          })
+        end
 
-      resolved_key = evaluation_options.variable_key
-      variable = get_in(snap.datafile, ["variables", resolved_key])
-      sticky = Map.get(options, :__child_sticky_variables, snap.sticky_variables || %{})
+      memo_options =
+        Map.merge(evaluation_options, %{
+          sticky_owner: true,
+          sticky_features_token: options[:__sticky_features_token],
+          sticky_variables_token: options[:__sticky_variables_token],
+          regex_cache: snap.regex_cache,
+          report: reporter(instance),
+          state_signature: options.__state_signature,
+          child_signature: options[:__child_signature]
+        })
 
-      evaluation =
-        cond do
-          Map.has_key?(sticky, resolved_key) ->
-            %Featurevisor.Evaluation{
-              type: :variable,
-              variable_key: resolved_key,
-              variable: variable,
-              variable_value: sticky[resolved_key],
-              reason: :sticky
-            }
+      try do
+        EvaluationSession.run(
+          session,
+          memo_options,
+          options[:__prerequisite] == true,
+          fn evaluation_options ->
+            {evaluation_options, resolved_options} =
+              if snap.modules == [],
+                do: {evaluation_options, options},
+                else:
+                  before_global_modules(snap.modules, evaluation_options, memo_options, options)
 
-          variable &&
-              not required_features_match?(
-                instance,
-                variable["requiredFeatures"],
-                evaluation_options.context,
-                options
-              ) ->
-            value =
-              if variable["useDefaultWhenDisabled"],
-                do: variable["defaultValue"],
-                else: variable["disabledValue"]
+            if snap.modules != [],
+              do: EvaluationSession.update_current(session, evaluation_options)
 
-            %Featurevisor.Evaluation{
-              type: :variable,
-              variable_key: resolved_key,
-              variable: variable,
-              variable_value: value,
-              reason: :required_features_unmet
-            }
+            resolved_key = evaluation_options.variable_key
 
-          variable ->
-            case matched_global_override(
-                   instance,
-                   snap,
-                   variable["overrides"] || [],
-                   evaluation_options.context,
-                   options
-                 ) do
-              {override, index} ->
-                %Featurevisor.Evaluation{
-                  type: :variable,
-                  variable_key: resolved_key,
-                  variable: variable,
-                  variable_value: override["value"],
-                  variable_override_index: index,
-                  variable_override_key: override["key"],
-                  variable_override_path: override["keyPath"],
-                  reason: :variable_override_rule
+            variable =
+              read_entity(instance, "variables", resolved_key)
+
+            sticky = resolved_options.__sticky_variables_source.() || %{}
+
+            evaluation =
+              cond do
+                StickyStore.has_key?(sticky, resolved_key) ->
+                  %Featurevisor.Evaluation{
+                    type: :variable,
+                    variable_key: resolved_key,
+                    variable: variable,
+                    variable_value: sticky[resolved_key],
+                    reason: :sticky
+                  }
+
+                variable ->
+                  evaluate_global_variable_definition(
+                    instance,
+                    snap,
+                    resolved_key,
+                    variable,
+                    evaluation_options.context,
+                    resolved_options
+                  )
+
+                true ->
+                  %Featurevisor.Evaluation{
+                    type: :variable,
+                    variable_key: resolved_key,
+                    reason: :variable_not_found
+                  }
+              end
+
+            value_present =
+              case evaluation.reason do
+                :sticky ->
+                  true
+
+                reason when reason in [:variable_override_rule, :variable_composed] ->
+                  true
+
+                :variable_default ->
+                  variable && Map.has_key?(variable, "defaultValue")
+
+                :conditions_unmet ->
+                  Map.has_key?(variable, "compose") or
+                    Map.has_key?(
+                      variable,
+                      if(variable["useDefaultWhenDisabled"],
+                        do: "defaultValue",
+                        else: "disabledValue"
+                      )
+                    )
+
+                _ ->
+                  false
+              end
+
+            evaluation =
+              if not value_present and evaluation_options.default_variable_present,
+                do: %{evaluation | variable_value: evaluation_options.default_variable_value},
+                else: evaluation
+
+            modules = Server.snapshot(instance.table).modules
+
+            after_options =
+              if modules == [] do
+                evaluation_options
+              else
+                evaluation_options
+                |> Map.drop([
+                  :sticky_owner,
+                  :sticky_features_token,
+                  :sticky_variables_token,
+                  :regex_cache,
+                  :report,
+                  :state_signature,
+                  :child_signature
+                ])
+                |> Map.put_new_lazy(:sticky_features, fn ->
+                  StickyStore.materialize(resolved_options.__sticky_features_source.())
+                end)
+                |> Map.put_new_lazy(:sticky_variables, fn ->
+                  StickyStore.materialize(resolved_options.__sticky_variables_source.())
+                end)
+              end
+
+            evaluation =
+              Enum.reduce(modules, evaluation, fn module, current ->
+                if module.after_evaluation,
+                  do: module.after_evaluation.(current, after_options),
+                  else: current
+              end)
+
+            if variable && variable["deprecated"] do
+              report(instance, %{
+                level: :warn,
+                code: "deprecated_variable",
+                message: "Variable \"#{resolved_key}\" is deprecated",
+                details: %{
+                  variableKey: resolved_key,
+                  evaluation: Featurevisor.Evaluation.to_map(evaluation)
                 }
-
-              nil ->
-                %Featurevisor.Evaluation{
-                  type: :variable,
-                  variable_key: resolved_key,
-                  variable: variable,
-                  variable_value: variable["defaultValue"],
-                  reason: :variable_default
-                }
+              })
             end
 
-          true ->
-            %Featurevisor.Evaluation{
-              type: :variable,
-              variable_key: resolved_key,
-              reason: :variable_not_found
-            }
-        end
+            report(instance, %{
+              level: :debug,
+              code: Atom.to_string(evaluation.reason),
+              message: "Global variable evaluated",
+              details: Featurevisor.Evaluation.to_map(evaluation)
+            })
 
-      value_present =
-        case evaluation.reason do
-          :sticky ->
-            true
+            evaluation
+          end
+        )
+      rescue
+        error ->
+          if (match?(%Featurevisor.RequirementCycleError{}, error) or
+                match?(%Featurevisor.RequirementError{}, error)) and
+               options[:__prerequisite] == true,
+             do: reraise(error, __STACKTRACE__)
 
-          :variable_override_rule ->
-            true
-
-          :variable_default ->
-            variable && Map.has_key?(variable, "defaultValue")
-
-          :required_features_unmet ->
-            variable &&
-              Map.has_key?(
-                variable,
-                if(variable["useDefaultWhenDisabled"], do: "defaultValue", else: "disabledValue")
-              )
-
-          _ ->
-            false
-        end
-
-      evaluation =
-        if not value_present and evaluation_options.default_variable_present,
-          do: %{evaluation | variable_value: evaluation_options.default_variable_value},
-          else: evaluation
-
-      evaluation =
-        Enum.reduce(snap.modules, evaluation, fn module, current ->
-          if module.after_evaluation,
-            do: module.after_evaluation.(current, evaluation_options),
-            else: current
-        end)
-
-      if variable && variable["deprecated"] do
-        report(instance, %{
-          level: :warn,
-          code: "variable_deprecated",
-          message: "Variable \"#{resolved_key}\" is deprecated",
-          details: %{
-            variableKey: resolved_key,
-            evaluation: Featurevisor.Evaluation.to_map(evaluation)
+          evaluation = %Featurevisor.Evaluation{
+            type: :variable,
+            variable_key: variable_key,
+            reason: :error,
+            error: error
           }
-        })
+
+          EvaluationSession.remember(
+            session,
+            memo_options,
+            evaluation,
+            options[:__prerequisite] == true
+          )
+
+          report(instance, %{
+            level: :error,
+            code: "evaluation_error",
+            message: "Global variable evaluation failed",
+            originalError: error,
+            details: Featurevisor.Evaluation.to_map(evaluation)
+          })
+
+          evaluation
       end
+    end)
+  end
 
-      report(instance, %{
-        level: :debug,
-        code: Atom.to_string(evaluation.reason),
-        message: "Global variable evaluated",
-        details: Featurevisor.Evaluation.to_map(evaluation)
-      })
+  defp before_global_modules(modules, evaluation_options, memo_options, options) do
+    evaluation_options =
+      Enum.reduce(
+        modules,
+        Map.drop(evaluation_options, [
+          :sticky_owner,
+          :sticky_features_token,
+          :sticky_variables_token,
+          :regex_cache,
+          :report,
+          :state_signature,
+          :child_signature
+        ]),
+        fn module, current ->
+          if module.before_evaluation,
+            do: module.before_evaluation.(current),
+            else: current
+        end
+      )
 
-      evaluation
-    rescue
-      error ->
-        evaluation = %Featurevisor.Evaluation{
-          type: :variable,
-          variable_key: variable_key,
-          reason: :error,
-          error: error
-        }
+    replaced_features = evaluation_options[:sticky_features] != memo_options[:sticky_features]
+    replaced_variables = evaluation_options[:sticky_variables] != memo_options[:sticky_variables]
 
-        report(instance, %{
-          level: :error,
-          code: "evaluation_error",
-          message: "Global variable evaluation failed",
-          originalError: error,
-          details: Featurevisor.Evaluation.to_map(evaluation)
-        })
+    if replaced_features or replaced_variables,
+      do: EvaluationSession.bypass_memo(options.__session)
 
-        evaluation
-    end
+    resolved_options =
+      options
+      |> Map.put(
+        :__sticky_features_source,
+        if(replaced_features,
+          do: fn -> evaluation_options[:sticky_features] end,
+          else: options.__sticky_features_source
+        )
+      )
+      |> Map.put(
+        :__sticky_variables_source,
+        if(replaced_variables,
+          do: fn -> evaluation_options[:sticky_variables] end,
+          else: options.__sticky_variables_source
+        )
+      )
+      |> Map.put(
+        :__sticky_features_token,
+        if(replaced_features, do: make_ref(), else: options[:__sticky_features_token])
+      )
+      |> Map.put(
+        :__sticky_variables_token,
+        if(replaced_variables, do: make_ref(), else: options[:__sticky_variables_token])
+      )
+
+    {evaluation_options, resolved_options}
   end
 
   @doc "Returns a global variable value or nil. JSON variables are decoded."
@@ -499,10 +642,22 @@ defmodule Featurevisor do
     evaluation = evaluate_global_variable(instance, variable_key, context, options)
     value = evaluation.variable_value
 
-    if get_in(evaluation.variable || %{}, ["type"]) == "json" and is_binary(value) do
+    if ((not evaluation.__getter_value_normalized and is_nil(evaluation.variable["compose"])) &&
+          get_in(evaluation.variable || %{}, ["type"]) == "json") and is_binary(value) do
       case Jason.decode(value) do
-        {:ok, parsed} -> parsed
-        {:error, _error} -> nil
+        {:ok, parsed} ->
+          parsed
+
+        {:error, error} ->
+          report(instance, %{
+            level: :error,
+            code: "evaluation_error",
+            message: "getVariable failed",
+            originalError: error,
+            details: %{variableKey: variable_key}
+          })
+
+          nil
       end
     else
       value
@@ -521,9 +676,9 @@ defmodule Featurevisor do
   def get_global_variable_integer(instance, key, context \\ %{}, options \\ %{}),
     do: typed(get_global_variable(instance, key, context, options), :integer)
 
-  @doc "Returns a typed numeric global variable."
-  def get_global_variable_double(instance, key, context \\ %{}, options \\ %{}),
-    do: typed(get_global_variable(instance, key, context, options), :double)
+  @doc "Returns a typed number global variable, whole or fractional."
+  def get_global_variable_number(instance, key, context \\ %{}, options \\ %{}),
+    do: typed(get_global_variable(instance, key, context, options), :number)
 
   @doc "Returns a typed list global variable."
   def get_global_variable_array(instance, key, context \\ %{}, options \\ %{}),
@@ -574,19 +729,6 @@ defmodule Featurevisor do
       ) do
     keys = if variable_keys == [], do: get_global_variable_keys(instance), else: variable_keys
     Map.new(keys, &{&1, get_global_variable(instance, &1, context, options)})
-  end
-
-  @doc false
-  def segment_matches?(instance, segment_key, context \\ %{}) do
-    snap = snapshot(instance)
-
-    Conditions.all_segments?(
-      segment_key,
-      Map.merge(snap.context, context),
-      snap.datafile["segments"],
-      snap.regex_cache,
-      reporter(instance)
-    )
   end
 
   @doc "Registers an SDK module. Returns an idempotent removal function or nil."
@@ -741,80 +883,471 @@ defmodule Featurevisor do
   end
 
   defp evaluate(instance, type, feature_key, variable_key, context, options) do
-    snap = snapshot(instance)
-    options = normalize_options(options)
+    Server.with_snapshot(instance.table, fn snap ->
+      evaluate_snapshot(instance, snap, type, feature_key, variable_key, context, options)
+    end)
+  end
 
-    evaluation_options = %{
-      type: type,
-      feature_key: feature_key,
-      variable_key: variable_key,
-      context: Map.merge(snap.context, context),
+  defp evaluate_snapshot(instance, snap, type, feature_key, variable_key, context, options) do
+    options = normalize_options(options)
+    options = evaluation_sources(instance, options)
+
+    with_request_session(options, fn options ->
+      Server.seed_request_cache(instance.table, snap)
+      session = options.__session
+
+      evaluation_options = %{
+        type: type,
+        feature_key: feature_key,
+        variable_key: variable_key,
+        context: effective_context(snap, context, options),
+        # Preserve ordinary maps in callback options. The common path without
+        # modules reads only the entity rows it actually needs.
+        datafile:
+          if(snap.modules == [],
+            do: snap.datafile,
+            else: Server.materialize_datafile(snap.datafile)
+          ),
+        regex_cache: snap.regex_cache,
+        report: reporter(instance),
+        modules: snap.modules,
+        sticky_features:
+          if(snap.modules == [],
+            do: options.__sticky_features_source.(),
+            else: StickyStore.materialize(options.__sticky_features_source.())
+          ),
+        sticky_variables:
+          if(snap.modules == [],
+            do: options.__sticky_variables_source.(),
+            else: StickyStore.materialize(options.__sticky_variables_source.())
+          ),
+        sticky_owner: true,
+        sticky_features_token: options[:__sticky_features_token],
+        sticky_variables_token: options[:__sticky_variables_token],
+        session: session,
+        prerequisite: options[:__prerequisite] == true,
+        dependency_purpose: options[:__dependency_purpose],
+        state_signature: options.__state_signature,
+        state_source: fn -> Server.snapshot(instance.table) end,
+        entity_source: fn kind, key -> read_entity(instance, kind, key) end,
+        child_signature: options[:__child_signature],
+        sticky_features_source: options.__sticky_features_source,
+        sticky_variables_source: options.__sticky_variables_source,
+        condition_leaf: fn condition, dependencies ->
+          condition_leaf?(instance, condition, dependencies)
+        end,
+        default_variation_present: Map.has_key?(options, :default_variation_value),
+        default_variation_value: Map.get(options, :default_variation_value),
+        default_variable_present: Map.has_key?(options, :default_variable_value),
+        default_variable_value: Map.get(options, :default_variable_value)
+      }
+
+      try do
+        Evaluator.evaluate_with_modules(evaluation_options)
+      rescue
+        error in [Featurevisor.RequirementCycleError, Featurevisor.RequirementError] ->
+          if options[:__prerequisite] == true do
+            reraise error, __STACKTRACE__
+          else
+            evaluation = %Featurevisor.Evaluation{
+              type: type,
+              feature_key: feature_key,
+              variable_key: variable_key,
+              reason: :error,
+              error: error
+            }
+
+            report(instance, %{
+              level: :error,
+              code: "evaluation_error",
+              message: "Evaluation failed",
+              originalError: error,
+              details: Featurevisor.Evaluation.to_map(evaluation)
+            })
+
+            evaluation
+          end
+      end
+    end)
+  end
+
+  defp effective_context(snap, context, options) do
+    if options[:__effective_context], do: context, else: Map.merge(snap.context, context)
+  end
+
+  defp read_entity(instance, kind, key) do
+    Server.with_snapshot(instance.table, fn snap ->
+      Featurevisor.Normalize.get(snap.datafile, kind, key, snap.regex_cache, reporter(instance))
+    end)
+  end
+
+  defp global_dependencies(instance, snap, context, options) do
+    %{
+      context: context,
       datafile: snap.datafile,
       regex_cache: snap.regex_cache,
       report: reporter(instance),
-      modules: snap.modules,
-      sticky: Map.get(options, :__child_sticky_features, snap.sticky_features),
-      default_variation_present: Map.has_key?(options, :default_variation_value),
-      default_variation_value: Map.get(options, :default_variation_value),
-      default_variable_present: Map.has_key?(options, :default_variable_value),
-      default_variable_value: Map.get(options, :default_variable_value)
+      session: options[:__session],
+      entity_source: fn kind, key -> read_entity(instance, kind, key) end,
+      sticky_features: options.__sticky_features_source.(),
+      sticky_variables: options.__sticky_variables_source.(),
+      sticky_features_source: options.__sticky_features_source,
+      sticky_variables_source: options.__sticky_variables_source,
+      sticky_features_token: options[:__sticky_features_token],
+      sticky_variables_token: options[:__sticky_variables_token],
+      child_signature: options[:__child_signature],
+      condition_leaf: fn condition, dependencies ->
+        condition_leaf?(instance, condition, dependencies)
+      end
     }
-
-    Evaluator.evaluate_with_modules(evaluation_options)
   end
 
-  defp required_features_match?(_instance, nil, _context, _options), do: true
+  defp evaluate_global_variable_definition(instance, snap, key, variable, context, options) do
+    if Map.has_key?(variable, "conditions") and
+         not Conditions.matches?(
+           variable["conditions"],
+           global_dependencies(instance, snap, context, options)
+         ) do
+      value_key =
+        if is_nil(variable["compose"]) && variable["useDefaultWhenDisabled"],
+          do: "defaultValue",
+          else: "disabledValue"
 
-  defp required_features_match?(instance, requirements, context, options) do
-    Enum.all?(requirements, fn requirement ->
-      {feature, enabled, variation} =
-        if is_binary(requirement) do
-          {requirement, true, nil}
+      %Featurevisor.Evaluation{
+        type: :variable,
+        variable_key: key,
+        variable: variable,
+        variable_value: variable[value_key],
+        reason: :conditions_unmet,
+        conditions: Featurevisor.Normalize.public(variable["conditions"])
+      }
+    else
+      initial =
+        if Map.has_key?(variable, "compose") do
+          %Featurevisor.Evaluation{
+            type: :variable,
+            variable_key: key,
+            variable: variable,
+            variable_value:
+              compose(
+                instance,
+                variable["compose"],
+                global_dependencies(instance, snap, context, options)
+              ),
+            reason: :variable_composed
+          }
         else
-          {requirement["feature"] || requirement["key"], Map.get(requirement, "enabled", true),
-           requirement["variation"]}
+          default_global_variable_evaluation(key, variable)
         end
 
-      enabled?(instance, feature, context, options) == enabled and
-        (is_nil(variation) or get_variation(instance, feature, context, options) == variation)
+      cond do
+        not is_nil(variable["overrideProgram"]) ->
+          evaluate_override_program(
+            instance,
+            snap,
+            key,
+            variable,
+            variable["overrideProgram"],
+            context,
+            Map.put(options, :__initial_evaluation, initial)
+          )
+
+        variable["compose"] ->
+          initial
+
+        true ->
+          case matched_global_override(
+                 instance,
+                 snap,
+                 variable["overrides"] || [],
+                 context,
+                 options
+               ) do
+            {override, index} ->
+              %{
+                initial
+                | variable_value: override["value"],
+                  variable_override_index: index,
+                  variable_override_key: override["key"],
+                  variable_override_path: override["keyPath"],
+                  reason: :variable_override_rule
+              }
+
+            nil ->
+              initial
+          end
+      end
+    end
+  end
+
+  defp compose(instance, source, dependencies) when is_binary(source) and source != "",
+    do: dependency_value(instance, %{"variable" => source}, dependencies, :composition)
+
+  defp compose(instance, entries, dependencies) when is_list(entries) and entries != [] do
+    Map.new(entries, fn entry ->
+      key = entry["key"]
+
+      if not is_binary(key) or key in ["", "__proto__", "prototype", "constructor"],
+        do: raise(Featurevisor.RequirementCycleError, message: "Invalid composition property")
+
+      {key, dependency_value(instance, entry, dependencies, :composition)}
     end)
   end
+
+  defp compose(_, _, _),
+    do: raise(Featurevisor.RequirementCycleError, message: "Invalid composition")
+
+  defp evaluate_override_program(instance, snap, key, variable, program, context, options)
+       when is_list(program) do
+    config = %{
+      instance: instance,
+      snap: snap,
+      key: key,
+      variable: variable,
+      program: program,
+      context: context,
+      options: options
+    }
+
+    evaluate_override_step(config, %{
+      index: 0,
+      value: options.__initial_evaluation.variable_value,
+      paths: [],
+      evaluation: options.__initial_evaluation
+    })
+  end
+
+  defp evaluate_override_program(_instance, _snap, _key, _variable, _program, _context, _options),
+    do: raise(ArgumentError, "Invalid variable override program")
+
+  defp evaluate_override_step(config, state) do
+    if state.index == length(config.program) do
+      state.evaluation
+    else
+      apply_override_step(config, state)
+    end
+  end
+
+  defp apply_override_step(config, state) do
+    override = Enum.at(config.program, state.index)
+
+    unless is_map(override), do: raise(ArgumentError, "Invalid variable override program")
+
+    matched =
+      global_override_matches?(
+        config.instance,
+        config.snap,
+        override,
+        config.context,
+        config.options
+      )
+
+    {value, paths, evaluation} =
+      if matched do
+        next_value = Mutations.apply(state.value, override["operations"])
+        next_paths = state.paths ++ [override["keyPath"] || [override["key"]]]
+
+        {next_value, next_paths,
+         %Featurevisor.Evaluation{
+           type: :variable,
+           variable_key: config.key,
+           variable: config.variable,
+           variable_value: next_value,
+           variable_override_index: state.index,
+           variable_override_key: override["key"],
+           variable_override_path: override["keyPath"],
+           variable_override_paths: next_paths,
+           reason: :variable_override_rule
+         }}
+      else
+        {state.value, state.paths, state.evaluation}
+      end
+
+    next_index = override[if(matched, do: "onMatch", else: "onMiss")]
+
+    unless is_integer(next_index) and next_index > state.index and
+             next_index <= length(config.program) do
+      raise ArgumentError, "Invalid variable override program jump"
+    end
+
+    evaluate_override_step(config, %{
+      index: next_index,
+      value: value,
+      paths: paths,
+      evaluation: evaluation
+    })
+  end
+
+  defp default_global_variable_evaluation(key, variable) do
+    %Featurevisor.Evaluation{
+      type: :variable,
+      variable_key: key,
+      variable: variable,
+      variable_value: variable["defaultValue"],
+      reason: :variable_default
+    }
+  end
+
+  defp condition_leaf?(instance, %{"variable" => _} = condition, dependencies) do
+    value = dependency_value(instance, condition, dependencies, :condition)
+
+    try do
+      {value, present} = required_path_value(value, Map.get(condition, "path", []))
+      Conditions.value_matches?(value, condition, dependencies.regex_cache, present)
+    rescue
+      error ->
+        reraise Featurevisor.RequirementError, [message: Exception.message(error)], __STACKTRACE__
+    end
+  end
+
+  defp condition_leaf?(instance, %{"feature" => _} = condition, dependencies) do
+    dependency_value(instance, Map.delete(condition, "variation"), dependencies, :condition) ==
+      Map.get(condition, "enabled", true) and
+      (not Map.has_key?(condition, "variation") or
+         dependency_value(
+           instance,
+           Map.put(condition, "variation", true),
+           dependencies,
+           :condition
+         ) == condition["variation"])
+  end
+
+  defp dependency_value(instance, reference, dependencies, purpose) do
+    features_source =
+      if dependencies[:sticky_features_token],
+        do: fn -> dependencies.sticky_features end,
+        else: dependencies[:sticky_features_source]
+
+    variables_source =
+      if dependencies[:sticky_variables_token],
+        do: fn -> dependencies.sticky_variables end,
+        else: dependencies[:sticky_variables_source]
+
+    getter_options = %{
+      __sticky_features_source: features_source,
+      __sticky_variables_source: variables_source,
+      __sticky_features_token: dependencies[:sticky_features_token],
+      __sticky_variables_token: dependencies[:sticky_variables_token],
+      __child_signature: dependencies[:child_signature],
+      __session: dependencies[:session],
+      __prerequisite: true,
+      __effective_context: true,
+      __dependency_purpose: purpose
+    }
+
+    cond do
+      Map.has_key?(reference, "variable") and Map.has_key?(reference, "feature") ->
+        get_variable(
+          instance,
+          reference["feature"],
+          reference["variable"],
+          dependencies.context,
+          getter_options
+        )
+
+      Map.has_key?(reference, "variable") ->
+        get_global_variable(
+          instance,
+          reference["variable"],
+          dependencies.context,
+          getter_options
+        )
+
+      reference["variation"] == true ->
+        get_variation(instance, reference["feature"], dependencies.context, getter_options)
+
+      true ->
+        enabled?(instance, reference["feature"], dependencies.context, getter_options)
+    end
+  end
+
+  defp required_path_value(value, path) when is_list(path) do
+    Enum.reduce_while(path, {value, true}, fn part, {current, _present} ->
+      case required_path_part(current, part) do
+        {:ok, next} -> {:cont, {next, true}}
+        :missing -> {:halt, {nil, false}}
+      end
+    end)
+  end
+
+  defp required_path_value(_value, _path),
+    do: raise(ArgumentError, "Variable requirement path must be compiled")
+
+  defp required_path_part(value, part) when is_binary(part) and is_map(value) do
+    if part in ["__proto__", "prototype", "constructor"] do
+      raise ArgumentError, "Unsafe variable requirement path"
+    end
+
+    Map.fetch(value, part)
+    |> case do
+      {:ok, next} -> {:ok, next}
+      :error -> :missing
+    end
+  end
+
+  defp required_path_part(value, "length") when is_list(value), do: {:ok, length(value)}
+
+  defp required_path_part(value, part) when is_binary(part) and is_list(value) do
+    if Regex.match?(~r/^(0|[1-9][0-9]*)$/, part) do
+      required_path_part(value, String.to_integer(part))
+    else
+      :missing
+    end
+  end
+
+  defp required_path_part(value, part) when is_number(part) do
+    case safe_array_index(part) do
+      {:ok, index} when is_list(value) ->
+        if index < length(value), do: {:ok, Enum.at(value, index)}, else: :missing
+
+      {:ok, _index} ->
+        :missing
+
+      :error ->
+        raise ArgumentError, "Invalid variable requirement path"
+    end
+  end
+
+  defp required_path_part(_value, part) when is_binary(part), do: :missing
+
+  defp required_path_part(_value, _part),
+    do: raise(ArgumentError, "Invalid variable requirement path")
+
+  defp safe_array_index(value)
+       when is_integer(value) and value >= 0 and value <= 9_007_199_254_740_991,
+       do: {:ok, value}
+
+  defp safe_array_index(value) when is_float(value) do
+    if abs(value) < 1.797_693_134_862_315_7e308 and value >= 0 and
+         value <= 9_007_199_254_740_991 and value == trunc(value),
+       do: {:ok, trunc(value)},
+       else: :error
+  end
+
+  defp safe_array_index(_value), do: :error
 
   defp matched_global_override(instance, snap, overrides, context, options) do
     overrides
     |> Enum.with_index()
     |> Enum.find_value(fn {override, index} ->
-      requirements_match =
-        required_features_match?(instance, override["requiredFeatures"], context, options)
-
-      conditions_match =
-        not Map.has_key?(override, "conditions") or
-          Conditions.all_conditions?(
-            Conditions.parse_conditions(override["conditions"], reporter(instance)),
-            context,
-            snap.regex_cache,
-            reporter(instance)
-          )
-
-      segments_match =
-        not Map.has_key?(override, "segments") or
-          Conditions.all_segments?(
-            Conditions.parse_segments(override["segments"]),
-            context,
-            snap.datafile["segments"],
-            snap.regex_cache,
-            reporter(instance)
-          )
-
-      if requirements_match and conditions_match and segments_match, do: {override, index}
+      if global_override_matches?(instance, snap, override, context, options),
+        do: {override, index}
     end)
+  end
+
+  defp global_override_matches?(instance, snap, override, context, options) do
+    not Map.has_key?(override, "conditions") or
+      Conditions.matches?(
+        override["conditions"],
+        global_dependencies(instance, snap, context, options)
+      )
   end
 
   defp typed(value, :boolean) when is_boolean(value), do: value
   defp typed(value, :string) when is_binary(value), do: value
   defp typed(value, :integer) when is_integer(value), do: value
   defp typed(value, :integer) when is_float(value) and value == trunc(value), do: trunc(value)
-  defp typed(value, :double) when is_number(value), do: value
+  defp typed(value, :number) when is_number(value), do: value
   defp typed(value, :array) when is_list(value), do: value
   defp typed(value, :object) when is_map(value), do: value
   defp typed(_, _), do: nil
@@ -823,6 +1356,41 @@ defmodule Featurevisor do
   defp open?(instance), do: Process.alive?(instance.pid) and not snapshot(instance).closed
   defp normalize_options(options) when is_list(options), do: Map.new(options)
   defp normalize_options(options) when is_map(options), do: options
+
+  defp evaluation_sources(instance, options) do
+    options
+    |> Map.put_new(:__sticky_features_source, fn ->
+      Server.snapshot(instance.table).sticky_features
+    end)
+    |> Map.put_new(:__sticky_variables_source, fn ->
+      Server.snapshot(instance.table).sticky_variables
+    end)
+    |> Map.put_new(:__state_signature, fn ->
+      snap = Server.snapshot(instance.table)
+
+      {snap.regex_cache, snap.generation}
+    end)
+  end
+
+  defp with_request_session(options, fun) do
+    case options[:__session] do
+      nil ->
+        session = EvaluationSession.new()
+
+        try do
+          Server.with_request_cache(fn ->
+            Featurevisor.Child.with_request_cache(options[:__child_snapshot], fn ->
+              fun.(Map.put(options, :__session, session))
+            end)
+          end)
+        after
+          EvaluationSession.close(session)
+        end
+
+      _ ->
+        fun.(options)
+    end
+  end
 
   defp initialize_instance(pid, options) do
     instance = %__MODULE__{pid: pid, table: Server.table(pid)}
@@ -987,6 +1555,9 @@ defmodule Featurevisor do
     fun.()
   rescue
     error -> IO.puts(:stderr, "[Featurevisor] Callback failed: #{Exception.message(error)}")
+  catch
+    kind, reason ->
+      IO.puts(:stderr, "[Featurevisor] Callback failed: #{Exception.format_banner(kind, reason)}")
   end
 
   defp once(fun) do

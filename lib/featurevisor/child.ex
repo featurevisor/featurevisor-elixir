@@ -1,9 +1,10 @@
 defmodule Featurevisor.Child do
   @moduledoc "A child Featurevisor instance with isolated context and sticky state."
-  alias Featurevisor.Evaluation
+  alias Featurevisor.{Evaluation, StickyStore}
+  @request_cache_key {__MODULE__, :request_cache}
 
-  @opaque t :: %__MODULE__{parent: Featurevisor.t(), agent: pid()}
-  defstruct [:parent, :agent]
+  @opaque t :: %__MODULE__{parent: Featurevisor.t(), agent: pid(), sticky_store: pid()}
+  defstruct [:parent, :agent, :sticky_store]
 
   @doc false
   @spec create(Featurevisor.t(), map(), map() | keyword()) :: t()
@@ -17,25 +18,37 @@ defmodule Featurevisor.Child do
           context: stored,
           sticky_features: Map.get(options, :sticky_features, %{}),
           sticky_variables: Map.get(options, :sticky_variables, %{}),
+          sticky_table: nil,
           listeners: %{},
           unsubs: [],
+          generation: 0,
           closed: false
         }
       end)
 
-    %__MODULE__{parent: parent, agent: agent}
+    {:ok, sticky_store} = StickyStore.start(agent)
+
+    Agent.update(agent, fn state ->
+      Process.link(sticky_store)
+      table = StickyStore.create(sticky_store, state.sticky_features, state.sticky_variables)
+      state |> Map.put(:sticky_table, table) |> Map.put(:sticky_store, sticky_store)
+    end)
+
+    %__MODULE__{parent: parent, agent: agent, sticky_store: sticky_store}
   end
 
   @doc "Merges or replaces child context."
   def set_context(child, context, replace \\ false) do
-    if Process.alive?(child.agent), do: set_live_context(child, context, replace), else: :ok
+    while_live(child, :ok, fn -> set_live_context(child, context, replace) end)
   end
 
   defp set_live_context(child, context, replace) do
     details =
       Agent.get_and_update(child.agent, fn state ->
         value = if replace, do: context, else: Map.merge(state.context, context)
-        {%{context: value, replaced: replace}, %{state | context: value}}
+
+        {%{context: value, replaced: replace},
+         %{state | context: value, generation: state.generation + 1}}
       end)
 
     trigger(child, :context_set, details)
@@ -44,27 +57,29 @@ defmodule Featurevisor.Child do
 
   @doc "Returns the effective child context."
   def get_context(child, context \\ %{}) do
-    stored = if Process.alive?(child.agent), do: Agent.get(child.agent, & &1.context), else: %{}
+    stored = while_live(child, %{}, fn -> Agent.get(child.agent, & &1.context) end)
     Featurevisor.get_context(child.parent) |> Map.merge(stored) |> Map.merge(context)
   end
 
   @doc "Merges or replaces child sticky feature values."
   def set_sticky_features(child, sticky, replace \\ false) do
-    if Process.alive?(child.agent),
-      do: set_live_sticky_features(child, sticky, replace),
-      else: :ok
+    while_live(child, :ok, fn -> set_live_sticky_features(child, sticky, replace) end)
   end
 
   defp set_live_sticky_features(child, sticky, replace) do
-    details =
+    {details, old_table, sticky_store} =
       Agent.get_and_update(child.agent, fn state ->
         value = if replace, do: sticky, else: Map.merge(state.sticky_features, sticky)
+        table = StickyStore.create(state.sticky_store, value, state.sticky_variables)
 
-        {%{
-           features: Enum.uniq(Map.keys(state.sticky_features) ++ Map.keys(value)),
-           replaced: replace
-         }, %{state | sticky_features: value}}
+        {{%{
+            features: Enum.uniq(Map.keys(state.sticky_features) ++ Map.keys(value)),
+            replaced: replace
+          }, state.sticky_table, state.sticky_store},
+         %{state | sticky_features: value, sticky_table: table, generation: state.generation + 1}}
       end)
+
+    StickyStore.retire(sticky_store, old_table)
 
     trigger(child, :sticky_features_set, details)
     :ok
@@ -72,38 +87,52 @@ defmodule Featurevisor.Child do
 
   @doc "Merges or replaces child sticky global variable values."
   def set_sticky_variables(child, sticky, replace \\ false) do
-    if Process.alive?(child.agent) do
-      details =
+    while_live(child, :ok, fn ->
+      {details, old_table, sticky_store} =
         Agent.get_and_update(child.agent, fn state ->
           value = if replace, do: sticky, else: Map.merge(state.sticky_variables, sticky)
+          table = StickyStore.create(state.sticky_store, state.sticky_features, value)
 
-          {%{
-             variables: Enum.uniq(Map.keys(state.sticky_variables) ++ Map.keys(value)),
-             replaced: replace
-           }, %{state | sticky_variables: value}}
+          {{%{
+              variables: Enum.uniq(Map.keys(state.sticky_variables) ++ Map.keys(value)),
+              replaced: replace
+            }, state.sticky_table, state.sticky_store},
+           %{
+             state
+             | sticky_variables: value,
+               sticky_table: table,
+               generation: state.generation + 1
+           }}
         end)
 
-      trigger(child, :sticky_variables_set, details)
-    end
+      StickyStore.retire(sticky_store, old_table)
 
-    :ok
+      trigger(child, :sticky_variables_set, details)
+      :ok
+    end)
   end
 
   @doc "Subscribes to a child or delegated parent event."
   def on(child, event, callback)
       when event in [:context_set, :sticky_features_set, :sticky_variables_set] do
-    if Process.alive?(child.agent) do
+    while_live(child, once(fn -> :ok end), fn ->
       subscribe_to_local_event(child, event, callback)
-    else
-      once(fn -> :ok end)
-    end
+    end)
   end
 
   def on(child, event, callback) do
-    if Process.alive?(child.agent) do
+    if live?(child) do
       unsubscribe = Featurevisor.on(child.parent, event, callback)
-      Agent.update(child.agent, fn state -> %{state | unsubs: state.unsubs ++ [unsubscribe]} end)
-      once(fn -> unsubscribe.() end)
+
+      try do
+        Agent.update(child.agent, fn state -> %{state | unsubs: state.unsubs ++ [unsubscribe]} end)
+
+        watch_delegated_subscription(child, unsubscribe)
+      catch
+        :exit, reason ->
+          unsubscribe.()
+          if live?(child), do: exit(reason), else: once(fn -> :ok end)
+      end
     else
       once(fn -> :ok end)
     end
@@ -135,6 +164,23 @@ defmodule Featurevisor.Child do
                   )
             }
           end)
+    end)
+  end
+
+  defp watch_delegated_subscription(child, unsubscribe) do
+    watcher =
+      spawn(fn ->
+        ref = Process.monitor(child.agent)
+
+        receive do
+          {:DOWN, ^ref, :process, _, _} -> unsubscribe.()
+          :stop -> :ok
+        end
+      end)
+
+    once(fn ->
+      unsubscribe.()
+      send(watcher, :stop)
     end)
   end
 
@@ -207,9 +253,9 @@ defmodule Featurevisor.Child do
   def get_variable_integer(child, key, variable, context \\ %{}, options \\ %{}),
     do: typed_variable(child, :get_variable_integer, key, variable, context, options)
 
-  @doc "Returns a finite numeric variable after runtime type checking."
-  def get_variable_double(child, key, variable, context \\ %{}, options \\ %{}),
-    do: typed_variable(child, :get_variable_double, key, variable, context, options)
+  @doc "Returns a finite number variable, whole or fractional, after runtime type checking."
+  def get_variable_number(child, key, variable, context \\ %{}, options \\ %{}),
+    do: typed_variable(child, :get_variable_number, key, variable, context, options)
 
   @doc "Returns a list variable after runtime type checking."
   def get_variable_array(child, key, variable, context \\ %{}, options \\ %{}),
@@ -257,7 +303,7 @@ defmodule Featurevisor.Child do
         boolean: :get_global_variable_boolean,
         string: :get_global_variable_string,
         integer: :get_global_variable_integer,
-        double: :get_global_variable_double,
+        number: :get_global_variable_number,
         array: :get_global_variable_array,
         object: :get_global_variable_object,
         json: :get_global_variable_json
@@ -286,9 +332,22 @@ defmodule Featurevisor.Child do
   @doc "Closes child listeners and delegated subscriptions."
   def close(child) do
     if Process.alive?(child.agent) do
-      unsubs = Agent.get(child.agent, & &1.unsubs)
+      unsubs =
+        try do
+          Agent.get(child.agent, & &1.unsubs)
+        catch
+          :exit, _ -> []
+        end
+
       Enum.each(unsubs, & &1.())
-      Agent.stop(child.agent)
+
+      if Process.alive?(child.agent) do
+        try do
+          Agent.stop(child.agent)
+        catch
+          :exit, _ -> :ok
+        end
+      end
     end
 
     :ok
@@ -296,15 +355,153 @@ defmodule Featurevisor.Child do
 
   defp child_options(child, options) do
     options = if is_list(options), do: Map.new(options), else: options
-
-    {sticky_features, sticky_variables} =
-      if Process.alive?(child.agent),
-        do: Agent.get(child.agent, &{&1.sticky_features, &1.sticky_variables}),
-        else: {%{}, %{}}
+    snapshot = sticky_snapshot(child)
 
     options
-    |> Map.put(:__child_sticky_features, sticky_features)
-    |> Map.put(:__child_sticky_variables, sticky_variables)
+    |> Map.put(:__child_snapshot, {child.agent, snapshot})
+    |> Map.put(:__sticky_features_source, fn -> cached_sticky(child).sticky_features end)
+    |> Map.put(:__sticky_variables_source, fn -> cached_sticky(child).sticky_variables end)
+    |> Map.put(:__child_signature, fn -> cached_sticky(child).generation end)
+  end
+
+  @doc false
+  def with_request_cache(initial, fun) do
+    previous = Process.get(@request_cache_key)
+
+    {cache, pinned} =
+      case initial do
+        {agent, %{sticky_table: table} = snapshot} when not is_nil(table) ->
+          if StickyStore.pin(table), do: {%{agent => snapshot}, [table]}, else: {%{}, []}
+
+        _ ->
+          {%{}, []}
+      end
+
+    cache = Map.put(cache, :pinned, pinned)
+    Process.put(@request_cache_key, cache)
+
+    try do
+      fun.()
+    after
+      Process.get(@request_cache_key, %{})
+      |> Map.get(:pinned, [])
+      |> Enum.each(&StickyStore.unpin/1)
+
+      if is_nil(previous),
+        do: Process.delete(@request_cache_key),
+        else: Process.put(@request_cache_key, previous)
+    end
+  end
+
+  defp sticky_snapshot(child) do
+    if live?(child) do
+      try do
+        Agent.get(child.agent, fn state ->
+          state
+          |> Map.take([:generation, :sticky_table])
+          |> sticky_views()
+        end)
+      catch
+        :exit, _ -> sticky_views(%{generation: nil, sticky_table: nil})
+      end
+    else
+      sticky_views(%{generation: nil, sticky_table: nil})
+    end
+  end
+
+  defp sticky_views(%{sticky_table: nil} = snapshot),
+    do: Map.merge(snapshot, %{sticky_features: %{}, sticky_variables: %{}})
+
+  defp sticky_views(%{sticky_table: table} = snapshot),
+    do:
+      Map.merge(snapshot, %{
+        sticky_features: StickyStore.view(table, :features),
+        sticky_variables: StickyStore.view(table, :variables)
+      })
+
+  defp cached_sticky(child) do
+    case Process.get(@request_cache_key) do
+      nil ->
+        snapshot = sticky_snapshot(child)
+
+        if is_nil(snapshot.sticky_table) do
+          snapshot
+        else
+          if StickyStore.pin(snapshot.sticky_table) do
+            try do
+              %{
+                snapshot
+                | sticky_table: nil,
+                  sticky_features: StickyStore.materialize(snapshot.sticky_features),
+                  sticky_variables: StickyStore.materialize(snapshot.sticky_variables)
+              }
+            after
+              StickyStore.unpin(snapshot.sticky_table)
+            end
+          else
+            retry_sticky(child, snapshot)
+          end
+        end
+
+      cache ->
+        generation = child_value(child, :generation, nil)
+
+        case Map.get(cache, child.agent) do
+          %{generation: ^generation} = snapshot ->
+            snapshot
+
+          _ ->
+            snapshot = sticky_snapshot(child)
+
+            if is_nil(snapshot.sticky_table) or StickyStore.pin(snapshot.sticky_table) do
+              pinned =
+                if snapshot.sticky_table,
+                  do: [snapshot.sticky_table | cache.pinned],
+                  else: cache.pinned
+
+              Process.put(
+                @request_cache_key,
+                cache |> Map.put(child.agent, snapshot) |> Map.put(:pinned, pinned)
+              )
+
+              snapshot
+            else
+              retry_sticky(child, snapshot)
+            end
+        end
+    end
+  end
+
+  defp retry_sticky(child, snapshot) do
+    current = sticky_snapshot(child)
+
+    if current.generation == snapshot.generation and
+         current.sticky_table == snapshot.sticky_table,
+       do: sticky_views(%{generation: nil, sticky_table: nil}),
+       else: cached_sticky(child)
+  end
+
+  defp child_value(child, key, default) do
+    if live?(child) do
+      try do
+        Agent.get(child.agent, &Map.get(&1, key, default))
+      catch
+        :exit, _ -> default
+      end
+    else
+      default
+    end
+  end
+
+  defp live?(child),
+    do:
+      Process.alive?(child.agent) and is_pid(child.sticky_store) and
+        Process.alive?(child.sticky_store)
+
+  defp while_live(child, fallback, fun) do
+    if live?(child), do: fun.(), else: fallback
+  catch
+    :exit, reason -> if live?(child), do: exit(reason), else: fallback
   end
 
   defp typed_variable(child, function, key, variable, context, options) do
