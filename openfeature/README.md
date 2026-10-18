@@ -16,6 +16,8 @@ end
 
 The provider is a separate package, so applications that only use
 `featurevisor` do not install or compile OpenFeature.
+The supported upstream SDK is `open_feature` 0.1.3, the latest stable Hex
+release. It requires no change to the provider's Elixir 1.15 minimum.
 
 ## Usage
 
@@ -62,6 +64,11 @@ Featurevisor reasons and evaluation metadata are mapped to OpenFeature
 resolution details. Missing definitions, type mismatches, and invalid
 datafiles use standard OpenFeature errors. Replacing an invalid datafile with
 a valid one recovers the provider.
+If initial registration fails, update the provider's Featurevisor instance with
+a valid datafile and call `OpenFeature.set_provider` again. OpenFeature 0.1.3
+does not register a provider whose initialisation fails. Once registered, valid
+updates recover evaluation without registering again, including an unchanged
+accepted datafile after a rejection.
 
 Calling `shutdown/1` releases provider subscriptions. It also closes a
 Featurevisor instance created by the provider, but never closes a borrowed

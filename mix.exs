@@ -1,7 +1,7 @@
 defmodule Featurevisor.MixProject do
   use Mix.Project
 
-  @version "1.2.0"
+  @version "2.0.0"
   @source_url "https://github.com/featurevisor/featurevisor-elixir"
 
   def project do
@@ -45,6 +45,7 @@ defmodule Featurevisor.MixProject do
     [
       licenses: ["MIT"],
       links: %{"GitHub" => @source_url, "Featurevisor" => "https://featurevisor.com"},
+      # Tests and conformance fixtures stay in the repository, not in the package.
       files: ["lib", "mix.exs", "README.md", "LICENSE"]
     ]
   end

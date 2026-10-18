@@ -1,31 +1,96 @@
 defmodule Featurevisor.Evaluator do
   @moduledoc false
 
-  alias Featurevisor.{Bucketer, Conditions, Evaluation}
+  alias Featurevisor.{
+    Bucketer,
+    Conditions,
+    Evaluation,
+    EvaluationSession,
+    RequirementCycleError,
+    RequirementError,
+    StickyStore
+  }
+
+  @private_options [
+    :session,
+    :prerequisite,
+    :state_signature,
+    :state_source,
+    :entity_source,
+    :child_signature,
+    :sticky_owner,
+    :sticky_features_token,
+    :sticky_variables_token,
+    :sticky_features_source,
+    :sticky_variables_source,
+    :condition_leaf,
+    :regex_cache,
+    :default_variation_present,
+    :default_variable_present
+  ]
 
   def evaluate_with_modules(options) do
     options =
-      Enum.reduce(options.modules, options, fn module, current ->
-        if module.before, do: module.before.(current), else: current
-      end)
+      if options[:prerequisite] == true do
+        current = options.state_source.()
+
+        options
+        |> then(fn options ->
+          if options[:sticky_features_token],
+            do: options,
+            else: Map.put(options, :sticky_features, options.sticky_features_source.())
+        end)
+        |> then(fn options ->
+          if options[:sticky_variables_token],
+            do: options,
+            else: Map.put(options, :sticky_variables, options.sticky_variables_source.())
+        end)
+        |> Map.put(:modules, current.modules)
+      else
+        options
+      end
 
     options =
-      Enum.reduce(options.modules, options, fn module, current ->
-        if module.before_evaluation, do: module.before_evaluation.(current), else: current
+      if options.modules == [] do
+        options
+      else
+        options
+        |> Map.update!(:sticky_features, &StickyStore.materialize/1)
+        |> Map.update!(:sticky_variables, &StickyStore.materialize/1)
+      end
+
+    EvaluationSession.run(options.session, options, options[:prerequisite] == true, fn options ->
+      options =
+        if options.modules == [],
+          do: refresh_inherited_sticky(options, options, false, false),
+          else: before_modules(options)
+
+      if options.modules != [], do: EvaluationSession.update_current(options.session, options)
+
+      evaluation = evaluate(options)
+      evaluation = apply_default(evaluation, options)
+
+      modules = options.state_source.().modules
+
+      after_options =
+        if modules == [],
+          do: options,
+          else:
+            options
+            |> Map.update!(:datafile, &Featurevisor.Server.materialize_datafile/1)
+            |> Map.update!(:sticky_features, &StickyStore.materialize/1)
+            |> Map.update!(:sticky_variables, &StickyStore.materialize/1)
+
+      Enum.reduce(modules, evaluation, fn module, current ->
+        if module.after_evaluation,
+          do: module.after_evaluation.(current, Map.drop(after_options, @private_options)),
+          else: current
       end)
-
-    evaluation = evaluate(options)
-    evaluation = apply_default(evaluation, options)
-
-    evaluation =
-      Enum.reduce(options.modules, evaluation, fn module, current ->
-        if module.after_evaluation, do: module.after_evaluation.(current, options), else: current
-      end)
-
-    Enum.reduce(options.modules, evaluation, fn module, current ->
-      if module.after, do: module.after.(current, options), else: current
     end)
   rescue
+    error in [RequirementCycleError, RequirementError] ->
+      reraise error, __STACKTRACE__
+
     error ->
       evaluation = %Evaluation{
         type: options.type,
@@ -34,6 +99,13 @@ defmodule Featurevisor.Evaluator do
         reason: :error,
         error: error
       }
+
+      EvaluationSession.remember(
+        options.session,
+        options,
+        evaluation,
+        options[:prerequisite] == true
+      )
 
       report_evaluation(
         options.report,
@@ -44,6 +116,53 @@ defmodule Featurevisor.Evaluator do
       )
 
       evaluation
+  end
+
+  defp before_modules(original_options) do
+    module_options =
+      Enum.reduce(
+        original_options.modules,
+        Map.drop(original_options, @private_options),
+        fn module, current ->
+          if module.before_evaluation, do: module.before_evaluation.(current), else: current
+        end
+      )
+
+    replaced_features = module_options[:sticky_features] != original_options[:sticky_features]
+    replaced_variables = module_options[:sticky_variables] != original_options[:sticky_variables]
+
+    if replaced_features or replaced_variables,
+      do: EvaluationSession.bypass_memo(original_options.session)
+
+    module_options
+    |> Map.drop(@private_options)
+    |> Map.merge(Map.take(original_options, @private_options))
+    |> refresh_inherited_sticky(original_options, replaced_features, replaced_variables)
+  end
+
+  defp refresh_inherited_sticky(options, original_options, replaced_features, replaced_variables) do
+    options =
+      cond do
+        replaced_features ->
+          Map.put(options, :sticky_features_token, make_ref())
+
+        original_options[:sticky_features_token] ->
+          options
+
+        true ->
+          Map.put(options, :sticky_features, original_options.sticky_features_source.())
+      end
+
+    cond do
+      replaced_variables ->
+        Map.put(options, :sticky_variables_token, make_ref())
+
+      original_options[:sticky_variables_token] ->
+        options
+
+      true ->
+        Map.put(options, :sticky_variables, original_options.sticky_variables_source.())
+    end
   end
 
   defp apply_default(
@@ -95,6 +214,9 @@ defmodule Featurevisor.Evaluator do
         evaluation
     end
   rescue
+    error in [RequirementCycleError, RequirementError] ->
+      reraise error, __STACKTRACE__
+
     error ->
       evaluation = %Evaluation{
         type: options.type,
@@ -123,7 +245,7 @@ defmodule Featurevisor.Evaluator do
   end
 
   defp disabled_evaluation(options) do
-    feature = get_in(options.datafile, ["features", options.feature_key])
+    feature = read_feature(options)
 
     base = %Evaluation{
       type: options.type,
@@ -179,14 +301,14 @@ defmodule Featurevisor.Evaluator do
   end
 
   defp sticky(options) do
-    sticky = options.sticky && options.sticky[options.feature_key]
+    sticky = options.sticky_features && options.sticky_features[options.feature_key]
 
     cond do
       is_nil(sticky) ->
         :continue
 
       options.type == :flag and Map.has_key?(sticky, "enabled") ->
-        return_sticky(options, %{enabled: sticky["enabled"], sticky: sticky})
+        return_sticky(options, %{enabled: sticky["enabled"], sticky_feature: sticky})
 
       options.type == :variation and Map.has_key?(sticky, "variation") ->
         return_sticky(options, %{variation_value: sticky["variation"]})
@@ -218,11 +340,24 @@ defmodule Featurevisor.Evaluator do
   end
 
   defp feature(options) do
-    case get_in(options.datafile, ["features", options.feature_key]) do
+    case read_feature(options) do
       nil -> {:error, :feature_not_found}
       feature -> {:ok, feature}
     end
   end
+
+  defp read_feature(%{entity_source: read} = options),
+    do: read.("features", options.feature_key)
+
+  defp read_feature(options),
+    do:
+      Featurevisor.Normalize.get(
+        options.datafile,
+        "features",
+        options.feature_key,
+        options.regex_cache,
+        options.report
+      )
 
   defp evaluate_feature(options, feature) do
     maybe_report_deprecated(options, feature)
@@ -230,7 +365,7 @@ defmodule Featurevisor.Evaluator do
     with {:ok, variable_schema} <- variable_schema(options, feature),
          :ok <- variations_available(options, feature),
          :continue <- forced(options, feature, variable_schema),
-         :continue <- required(options, feature) do
+         :continue <- root_conditions(options, feature) do
       bucket_and_evaluate(options, feature, variable_schema)
     else
       {:return, evaluation} -> evaluation
@@ -373,81 +508,31 @@ defmodule Featurevisor.Evaluator do
     |> Map.get("force", [])
     |> Enum.with_index()
     |> Enum.find_value(fn {force, index} ->
-      matched =
-        cond do
-          Map.has_key?(force, "conditions") ->
-            Conditions.all_conditions?(
-              Conditions.parse_conditions(force["conditions"], options.report),
-              options.context,
-              options.regex_cache,
-              options.report
-            )
-
-          Map.has_key?(force, "segments") ->
-            Conditions.all_segments?(
-              Conditions.parse_segments(force["segments"]),
-              options.context,
-              options.datafile["segments"],
-              options.regex_cache,
-              options.report
-            )
-
-          true ->
-            false
-        end
+      matched = Conditions.matches?(force["conditions"], options)
 
       if matched, do: {force, index}
     end)
   end
 
-  defp required(%{type: :flag} = options, feature) do
-    required = feature["requiredFeatures"] || feature["required"]
+  defp root_conditions(%{type: :flag} = options, feature) do
+    if Map.has_key?(feature, "conditions") and
+         not Conditions.matches?(feature["conditions"], options) do
+      evaluation = %Evaluation{
+        type: :flag,
+        feature_key: options.feature_key,
+        reason: :conditions_unmet,
+        conditions: Featurevisor.Normalize.public(feature["conditions"]),
+        enabled: false
+      }
 
-    if is_list(required) and required != [] do
-      enabled = Enum.all?(required, &required_enabled?(options, &1))
-      if enabled, do: :continue, else: required_return(options, required)
+      report_evaluation(options.report, evaluation, "root conditions did not match")
+      {:return, evaluation}
     else
       :continue
     end
   end
 
-  defp required(_, _), do: :continue
-
-  defp required_enabled?(options, required) do
-    {key, enabled, variation} =
-      if is_binary(required) do
-        {required, true, nil}
-      else
-        {required["feature"] || required["key"], Map.get(required, "enabled", true),
-         required["variation"]}
-      end
-
-    flag = evaluate_with_modules(%{options | type: :flag, feature_key: key, variable_key: nil})
-
-    flag.enabled == true == enabled and
-      (is_nil(variation) or
-         variation_value(
-           evaluate_with_modules(%{
-             options
-             | type: :variation,
-               feature_key: key,
-               variable_key: nil
-           })
-         ) == variation)
-  end
-
-  defp required_return(options, required) do
-    evaluation = %Evaluation{
-      type: :flag,
-      feature_key: options.feature_key,
-      reason: :required,
-      required_features: required,
-      enabled: false
-    }
-
-    report_evaluation(options.report, evaluation, "required features not enabled")
-    {:return, evaluation}
-  end
+  defp root_conditions(_, _), do: :continue
 
   defp bucket_and_evaluate(options, feature, schema) do
     bucket_key =
@@ -459,7 +544,7 @@ defmodule Featurevisor.Evaluator do
       )
 
     bucket_key =
-      Enum.reduce(options.modules, bucket_key, fn module, value ->
+      Enum.reduce(options.state_source.().modules, bucket_key, fn module, value ->
         if module.bucket_key,
           do:
             module.bucket_key.(%{
@@ -474,7 +559,7 @@ defmodule Featurevisor.Evaluator do
     bucket_value = Bucketer.bucketed_number(bucket_key)
 
     bucket_value =
-      Enum.reduce(options.modules, bucket_value, fn module, value ->
+      Enum.reduce(options.state_source.().modules, bucket_value, fn module, value ->
         if module.bucket_value,
           do:
             module.bucket_value.(%{
@@ -493,13 +578,7 @@ defmodule Featurevisor.Evaluator do
 
   defp matched_traffic(options, traffic) do
     Enum.find(traffic, fn rule ->
-      Conditions.all_segments?(
-        Conditions.parse_segments(rule["segments"]),
-        options.context,
-        options.datafile["segments"],
-        options.regex_cache,
-        options.report
-      )
+      Conditions.matches?(rule["conditions"], options)
     end)
   end
 
@@ -518,7 +597,7 @@ defmodule Featurevisor.Evaluator do
           evaluation(options, :rule, key, value, traffic, %{enabled: false})
 
         options.type == :flag ->
-          flag_traffic(options, feature, key, value, traffic)
+          flag_traffic(options, key, value, traffic)
 
         options.type == :variation ->
           variation_traffic(options, feature, key, value, traffic, allocation)
@@ -531,18 +610,8 @@ defmodule Featurevisor.Evaluator do
     result
   end
 
-  defp flag_traffic(options, feature, key, value, traffic) do
+  defp flag_traffic(options, key, value, traffic) do
     cond do
-      traffic && is_list(feature["ranges"]) && feature["ranges"] != [] ->
-        if Enum.any?(feature["ranges"], fn [start_value, end_value] ->
-             value >= start_value and value < end_value
-           end),
-           do:
-             evaluation(options, :allocated, key, value, traffic, %{
-               enabled: Map.get(traffic, "enabled", true)
-             }),
-           else: evaluation(options, :out_of_range, key, value, nil, %{enabled: false})
-
       traffic && Map.has_key?(traffic, "enabled") ->
         evaluation(options, :rule, key, value, traffic, %{enabled: traffic["enabled"]})
 
@@ -657,36 +726,14 @@ defmodule Featurevisor.Evaluator do
     overrides
     |> Enum.with_index()
     |> Enum.find_value(fn {override, index} ->
-      requirements_match =
-        Enum.all?(override["requiredFeatures"] || [], &required_enabled?(options, &1))
-
-      conditions_match =
-        not Map.has_key?(override, "conditions") or
-          Conditions.all_conditions?(
-            Conditions.parse_conditions(override["conditions"], options.report),
-            options.context,
-            options.regex_cache,
-            options.report
-          )
-
-      segments_match =
-        not Map.has_key?(override, "segments") or
-          Conditions.all_segments?(
-            Conditions.parse_segments(override["segments"]),
-            options.context,
-            options.datafile["segments"],
-            options.regex_cache,
-            options.report
-          )
-
-      matched =
-        requirements_match and conditions_match and segments_match and
-          (Map.has_key?(override, "conditions") or Map.has_key?(override, "segments") or
-             Map.has_key?(override, "requiredFeatures"))
-
-      if matched, do: {:override, override, index}
+      if feature_override_matches?(options, override), do: {:override, override, index}
     end)
   end
+
+  defp feature_override_matches?(options, override),
+    do:
+      Map.has_key?(override, "conditions") and
+        Conditions.matches?(override["conditions"], options)
 
   defp map_value(map, key) when is_map(map),
     do: if(Map.has_key?(map, key), do: {:value, map[key]}, else: :missing)
@@ -728,12 +775,6 @@ defmodule Featurevisor.Evaluator do
 
   defp variable_value_present?(_), do: false
 
-  defp variation_value(%Evaluation{variation_value: value}) when not is_nil(value), do: value
-
-  defp variation_value(%Evaluation{variation: variation}) when is_map(variation),
-    do: variation["value"]
-
-  defp variation_value(_), do: nil
   defp diagnostic_message(%Evaluation{reason: reason}), do: Atom.to_string(reason)
 
   defp report_evaluation(report, evaluation, message, level \\ :debug, code \\ nil) do

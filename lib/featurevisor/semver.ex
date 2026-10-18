@@ -27,9 +27,12 @@ defmodule Featurevisor.Semver do
       nil ->
         {:error, "Invalid argument not valid semver ('#{version}' received)"}
 
-      [_full | captures] ->
+      [^version | captures] ->
         captures = captures ++ List.duplicate("", 5 - length(captures))
         {:ok, Enum.map(captures, fn value -> if value == "", do: nil, else: value end)}
+
+      _ ->
+        {:error, "Invalid argument not valid semver ('#{version}' received)"}
     end
   end
 
@@ -38,38 +41,49 @@ defmodule Featurevisor.Semver do
   defp compare_pre(_, nil), do: -1
 
   defp compare_pre(left, right),
-    do: compare_segments(String.split(left, "."), String.split(right, "."))
+    do: compare_segments(String.split(left, "."), String.split(right, "."), true)
 
-  defp compare_segments(left, right) do
+  defp compare_segments(left, right, prerelease \\ false) do
     0..(max(length(left), length(right)) - 1)
     |> Enum.reduce_while(0, fn index, _ ->
-      result = compare_segment(Enum.at(left, index) || "0", Enum.at(right, index) || "0")
+      result =
+        if prerelease and (index == length(left) or index == length(right)) do
+          compare_value(length(left), length(right))
+        else
+          compare_segment(Enum.at(left, index) || "0", Enum.at(right, index) || "0", prerelease)
+        end
+
       if result == 0, do: {:cont, 0}, else: {:halt, result}
     end)
   end
 
-  defp compare_segment(left, right) do
-    if wildcard?(left) or wildcard?(right) do
+  defp compare_segment(left, right, prerelease) do
+    if not prerelease and (wildcard?(left) or wildcard?(right)) do
       0
     else
-      {left, right} = force_same_type(try_parse_integer(left), try_parse_integer(right))
-      compare_value(left, right)
+      an = Regex.match?(~r/\A[0-9]+\z/, left)
+      bn = Regex.match?(~r/\A[0-9]+\z/, right)
+
+      cond do
+        an and bn ->
+          left = String.trim_leading(left, "0")
+          right = String.trim_leading(right, "0")
+
+          case compare_value(byte_size(left), byte_size(right)) do
+            0 -> compare_value(left, right)
+            result -> result
+          end
+
+        prerelease and an != bn ->
+          if an, do: -1, else: 1
+
+        true ->
+          compare_value(left, right)
+      end
     end
   end
 
   defp wildcard?(value), do: value in ["*", "x", "X"]
-
-  defp try_parse_integer(value) do
-    case Integer.parse(value) do
-      {integer, _rest} -> integer
-      :error -> value
-    end
-  end
-
-  defp force_same_type(left, right) when is_integer(left) != is_integer(right),
-    do: {to_string(left), to_string(right)}
-
-  defp force_same_type(left, right), do: {left, right}
 
   defp compare_value(left, right) when left > right, do: 1
   defp compare_value(left, right) when left < right, do: -1

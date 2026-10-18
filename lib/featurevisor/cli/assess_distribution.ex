@@ -3,14 +3,19 @@ defmodule Featurevisor.CLI.AssessDistribution do
   alias Featurevisor.CLI.Project
 
   def run(options) do
-    targets = if options.target == [], do: [nil], else: Enum.uniq(options.target)
+    with {:ok, selections} <- Project.evaluation_selections(options) do
+      run_selections(options, selections)
+    end
+  end
 
-    Enum.reduce_while(targets, :ok, fn target, :ok ->
+  defp run_selections(options, selections) do
+    Enum.reduce_while(selections, :ok, fn {set, target}, :ok ->
       case Project.build(
              options.project_directory_path,
              options.environment,
              target,
-             options.inflate
+             options.inflate,
+             set
            ) do
         {:ok, datafile} ->
           f = Featurevisor.create_featurevisor(%{datafile: datafile, log_level: :fatal})
@@ -28,6 +33,7 @@ defmodule Featurevisor.CLI.AssessDistribution do
                     &Map.put(&2, &1, deterministic_uuid(index, &1))
                   )
 
+                if options.verbose, do: IO.puts("Context: #{Jason.encode!(context)}")
                 enabled = Featurevisor.enabled?(f, options.feature, context)
                 variation = Featurevisor.get_variation(f, options.feature, context)
 
@@ -44,6 +50,7 @@ defmodule Featurevisor.CLI.AssessDistribution do
           IO.puts("Feature: #{options.feature}")
           IO.puts("Environment: #{options.environment || false}")
           if target, do: IO.puts("Target: #{target}")
+          if set, do: IO.puts("Set: #{set}")
           IO.puts("Iterations: #{options.n}")
           IO.puts("\nFlag evaluations")
           print_count("enabled", counts.enabled, options.n)

@@ -4,14 +4,13 @@ defmodule Featurevisor.Evaluation do
   @type reason ::
           :feature_not_found
           | :disabled
-          | :required
-          | :out_of_range
           | :no_variations
           | :variation_disabled
           | :variable_not_found
           | :variable_default
           | :variable_disabled
-          | :required_features_unmet
+          | :conditions_unmet
+          | :variable_composed
           | :variable_override_variation
           | :variable_override_rule
           | :no_match
@@ -34,8 +33,8 @@ defmodule Featurevisor.Evaluation do
     :traffic,
     :force_index,
     :force,
-    :required_features,
-    :sticky,
+    :conditions,
+    :sticky_feature,
     :variation,
     :variation_value,
     :variable_key,
@@ -44,7 +43,9 @@ defmodule Featurevisor.Evaluation do
     :variable,
     :variable_override_index,
     :variable_override_key,
-    :variable_override_path
+    :variable_override_path,
+    :variable_override_paths,
+    __getter_value_normalized: false
   ]
 
   @doc "Converts an evaluation to its camelCase wire representation."
@@ -52,8 +53,18 @@ defmodule Featurevisor.Evaluation do
   def to_map(%__MODULE__{} = evaluation) do
     evaluation
     |> Map.from_struct()
-    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
-    |> Map.new(fn {key, value} -> {camelize(key), value} end)
+    |> Enum.reject(fn {key, value} ->
+      key == :__getter_value_normalized or
+        (is_nil(value) and not (key == :conditions and evaluation.reason == :conditions_unmet))
+    end)
+    |> Map.new(fn {key, value} ->
+      value =
+        if key in [:conditions, :traffic, :force, :variation, :variable],
+          do: Featurevisor.Normalize.public(value),
+          else: value
+
+      {camelize(key), value}
+    end)
   end
 
   defp camelize(:feature_key), do: "featureKey"
@@ -68,6 +79,7 @@ defmodule Featurevisor.Evaluation do
   defp camelize(:variable_override_index), do: "variableOverrideIndex"
   defp camelize(:variable_override_key), do: "variableOverrideKey"
   defp camelize(:variable_override_path), do: "variableOverridePath"
-  defp camelize(:required_features), do: "requiredFeatures"
+  defp camelize(:sticky_feature), do: "stickyFeature"
+  defp camelize(:variable_override_paths), do: "variableOverridePaths"
   defp camelize(key), do: Atom.to_string(key)
 end

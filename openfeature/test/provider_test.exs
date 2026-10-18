@@ -1,8 +1,103 @@
 defmodule FeaturevisorOpenFeature.ProviderTest do
   use ExUnit.Case, async: false
 
+  @provider_fixture Path.expand("../conformance/openfeature-provider.json", __DIR__)
+                    |> File.read!()
+                    |> Jason.decode!()
+
   alias FeaturevisorOpenFeature.Provider
   alias OpenFeature.ResolutionDetails
+
+  test "invalid initial shapes fail initialization without logging and recover" do
+    valid = @provider_fixture["datafile"]
+
+    for invalid <- [
+          "{",
+          "null",
+          "{}",
+          %{"schemaVersion" => "2", "revision" => "x", "features" => [], "segments" => %{}},
+          Map.put(valid, "variables", [])
+        ] do
+      provider = Provider.new(featurevisor_options: %{datafile: invalid, log_level: :fatal})
+      assert {:error, :parse_error} = Provider.initialize(provider, "initial", %{})
+
+      assert {:ok, %ResolutionDetails{error_code: :parse_error}} =
+               Provider.resolve_boolean_value(provider, "checkout", false, %{})
+
+      Featurevisor.set_datafile(provider.featurevisor, valid, true)
+      assert {:ok, %{state: :ready}} = Provider.initialize(provider, "initial", %{})
+      Provider.shutdown(provider)
+    end
+
+    provider =
+      Provider.new(
+        featurevisor_options: %{datafile: Map.put(valid, "revision", ""), log_level: :fatal}
+      )
+
+    assert {:ok, %{state: :ready}} = Provider.initialize(provider, "empty_revision", %{})
+    Provider.shutdown(provider)
+  end
+
+  test "shared provider conformance" do
+    fixture = @provider_fixture
+    assert fixture["kind"] == "featurevisor.openfeature-provider"
+    assert fixture["schemaVersion"] == 1
+    assert length(fixture["cases"]) == 16
+
+    provider =
+      Provider.new(featurevisor_options: %{datafile: fixture["datafile"], log_level: :fatal})
+
+    Enum.each(fixture["cases"], fn item ->
+      source = item["context"]
+
+      resolver =
+        case item["type"] do
+          "boolean" -> &Provider.resolve_boolean_value/4
+          "string" -> &Provider.resolve_string_value/4
+          "object" -> &Provider.resolve_map_value/4
+        end
+
+      assert {:ok, result} = resolver.(provider, item["flagKey"], item["default"], source)
+      expected = item["expected"]
+      assert result.value == expected["value"], item["name"]
+
+      if expected["reason"] do
+        assert result.reason == expected["reason"] |> String.downcase() |> String.to_atom(),
+               item["name"]
+      end
+
+      assert result.variant == expected["variant"], item["name"]
+
+      expected_error =
+        expected["errorCode"] && expected["errorCode"] |> String.downcase() |> String.to_atom()
+
+      assert result.error_code == expected_error, item["name"]
+      assert source == item["context"], item["name"]
+    end)
+
+    Enum.each(fixture["targetingCases"], fn item ->
+      source = item["context"]
+      assert {:ok, result} = Provider.resolve_boolean_value(provider, "targetOnly", false, source)
+      assert result.value == item["expectedValue"], item["name"]
+      assert source == item["context"], item["name"]
+    end)
+
+    Provider.shutdown(provider)
+
+    custom =
+      Provider.new(
+        featurevisor_options: %{datafile: fixture["datafile"], log_level: :fatal},
+        targeting_key_field: "accountId"
+      )
+
+    item = fixture["customTargetingCase"]
+
+    assert {:ok, result} =
+             Provider.resolve_boolean_value(custom, item["flagKey"], false, item["context"])
+
+    assert result.value == item["expectedValue"]
+    Provider.shutdown(custom)
+  end
 
   @datafile %{
     "schemaVersion" => "2",
@@ -112,6 +207,15 @@ defmodule FeaturevisorOpenFeature.ProviderTest do
       }
     },
     "variables" => %{
+      "requirementSource" => %{"type" => "boolean", "defaultValue" => false},
+      "requirementGate" => %{
+        "type" => "boolean",
+        "defaultValue" => true,
+        "disabledValue" => false,
+        "conditions" => [
+          %{"variable" => "requirementSource", "operator" => "equals", "value" => true}
+        ]
+      },
       "supportEmail" => %{
         "type" => "string",
         "defaultValue" => "support@example.com",
@@ -202,6 +306,15 @@ defmodule FeaturevisorOpenFeature.ProviderTest do
     assert :ok = Provider.shutdown(provider)
   end
 
+  test "an empty selector resolves the bare flag" do
+    provider = provider()
+
+    assert {:ok, %ResolutionDetails{value: true}} =
+             Provider.resolve_boolean_value(provider, "checkout:", false, %{})
+
+    Provider.shutdown(provider)
+  end
+
   test "supports custom key grammar and targeting key spellings" do
     provider =
       provider(
@@ -251,7 +364,7 @@ defmodule FeaturevisorOpenFeature.ProviderTest do
             %ResolutionDetails{
               value: "fallback",
               error_code: :flag_not_found,
-              error_message: ~s(Global variable "" was not found)
+              error_message: ~s(Feature "variable" was not found)
             }} = Provider.resolve_string_value(provider, "variable:", "fallback", %{})
 
     assert {:ok, %ResolutionDetails{value: "fallback", error_code: :flag_not_found}} =
@@ -315,6 +428,37 @@ defmodule FeaturevisorOpenFeature.ProviderTest do
                %{"blocked" => true}
              )
 
+    assert {:ok,
+            %ResolutionDetails{
+              value: false,
+              reason: :disabled,
+              flag_metadata: %{
+                "featurevisorReason" => "conditions_unmet"
+              }
+            }} =
+             Provider.resolve_boolean_value(provider, "variable:requirementGate", true, %{})
+
+    Provider.shutdown(provider)
+  end
+
+  test "real unmet feature prerequisites map to disabled" do
+    datafile =
+      put_in(@datafile, ["features", "blockedByRequirement"], %{
+        "bucketBy" => "userId",
+        "requiredFeatures" => ["missing"],
+        "traffic" => [%{"key" => "all", "segments" => "*", "percentage" => 100_000}]
+      })
+
+    provider = provider(featurevisor_options: %{datafile: datafile, log_level: :fatal})
+
+    assert {:ok,
+            %ResolutionDetails{
+              value: false,
+              reason: :disabled,
+              flag_metadata: %{"featurevisorReason" => "conditions_unmet"}
+            }} =
+             Provider.resolve_boolean_value(provider, "blockedByRequirement", true, %{})
+
     Provider.shutdown(provider)
   end
 
@@ -324,7 +468,7 @@ defmodule FeaturevisorOpenFeature.ProviderTest do
     assert {:ok, %ResolutionDetails{value: false, error_code: :parse_error}} =
              Provider.resolve_boolean_value(provider, "checkout", false, %{})
 
-    assert :ok = Featurevisor.set_datafile(provider.featurevisor, @datafile, true)
+    assert true == Featurevisor.set_datafile(provider.featurevisor, @datafile, true)
 
     assert {:ok, %ResolutionDetails{value: true}} =
              Provider.resolve_boolean_value(
@@ -334,7 +478,7 @@ defmodule FeaturevisorOpenFeature.ProviderTest do
                %{"targetingKey" => "forced-user"}
              )
 
-    assert {:error, _reason} = Featurevisor.set_datafile(provider.featurevisor, "{", true)
+    assert false == Featurevisor.set_datafile(provider.featurevisor, "{", true)
 
     assert {:ok, %ResolutionDetails{value: false, error_code: :parse_error}} =
              Provider.resolve_boolean_value(provider, "checkout", false, %{})
@@ -355,6 +499,74 @@ defmodule FeaturevisorOpenFeature.ProviderTest do
     assert details.value
     assert details.reason == :targeting_match
     assert details.flag_metadata["revision"] == "openfeature-test"
+  end
+
+  test "client registration retry and unchanged data recover after rejection" do
+    provider = provider(featurevisor_options: %{datafile: "{", log_level: :fatal})
+    on_exit(fn -> Provider.shutdown(provider) end)
+    assert {:error, _reason} = OpenFeature.set_provider(provider)
+    refute OpenFeature.get_provider().name == "Featurevisor"
+    assert Featurevisor.set_datafile(provider.featurevisor, @datafile, true)
+    assert {:ok, _registered} = OpenFeature.set_provider(provider)
+    client = OpenFeature.get_client()
+    context = %{"targetingKey" => "forced-user"}
+    assert OpenFeature.Client.get_boolean_value(client, "checkout", false, context: context)
+
+    assert OpenFeature.Client.get_boolean_details(client, "missing", true).error_code ==
+             :flag_not_found
+
+    assert OpenFeature.Client.get_boolean_details(client, "checkout:title", false).error_code ==
+             :type_mismatch
+
+    refute Featurevisor.set_datafile(provider.featurevisor, "{", true)
+    failed = OpenFeature.Client.get_boolean_details(client, "checkout", false, context: context)
+    refute failed.value
+    assert failed.error_code == :parse_error
+    assert Featurevisor.set_datafile(provider.featurevisor, @datafile, true)
+    assert OpenFeature.Client.get_boolean_value(client, "checkout", false, context: context)
+  end
+
+  test "client preserves explicitly empty targeting keys" do
+    fixture = @provider_fixture
+
+    {:ok, _initialized} =
+      Provider.new(featurevisor_options: %{datafile: fixture["datafile"], log_level: :fatal})
+      |> OpenFeature.set_provider()
+
+    client = OpenFeature.get_client()
+    source = %{"userId" => "forced"}
+
+    assert OpenFeature.Client.get_boolean_details(client, "targetOnly", false, context: source).value
+
+    refute OpenFeature.Client.get_boolean_details(client, "targetOnly", false,
+             context: Map.put(source, "targetingKey", "")
+           ).value
+
+    refute OpenFeature.Client.get_boolean_details(client, "targetOnly", false,
+             context: Map.put(source, "targetingKey", "other")
+           ).value
+
+    assert source == %{"userId" => "forced"}
+
+    {:ok, _custom} =
+      OpenFeature.set_provider(
+        "custom-targeting",
+        Provider.new(
+          featurevisor_options: %{datafile: fixture["datafile"], log_level: :fatal},
+          targeting_key_field: "accountId"
+        )
+      )
+
+    account = %{"targetingKey" => "", "accountId" => "old"}
+
+    assert OpenFeature.Client.get_boolean_details(
+             OpenFeature.get_client("custom-targeting"),
+             "accountTargeted",
+             false,
+             context: account
+           ).value
+
+    assert account == %{"targetingKey" => "", "accountId" => "old"}
   end
 
   test "closes owned instances and leaves borrowed instances open" do

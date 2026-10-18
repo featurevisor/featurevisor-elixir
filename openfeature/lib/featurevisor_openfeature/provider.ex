@@ -83,7 +83,11 @@ defmodule FeaturevisorOpenFeature.Provider do
   @doc "Initializes the provider for an OpenFeature domain."
   @impl true
   def initialize(provider, domain, _context) do
-    {:ok, %{provider | domain: domain, state: :ready}}
+    if datafile_error(provider.lifecycle) do
+      {:error, :parse_error}
+    else
+      {:ok, %{provider | domain: domain, state: :ready}}
+    end
   end
 
   @doc "Releases subscriptions and closes an owned Featurevisor instance."
@@ -137,16 +141,18 @@ defmodule FeaturevisorOpenFeature.Provider do
 
   defp initial_datafile_error(datafile) when is_binary(datafile) do
     case Jason.decode(datafile) do
-      {:ok, %{"revision" => revision}} when is_binary(revision) and revision != "" -> nil
+      {:ok, decoded} -> validate_initial_datafile(decoded)
       _error -> "Could not parse datafile"
     end
   end
 
-  defp initial_datafile_error(%{"revision" => revision})
-       when is_binary(revision) and revision != "",
-       do: nil
+  defp initial_datafile_error(datafile) do
+    validate_initial_datafile(datafile)
+  end
 
-  defp initial_datafile_error(_datafile), do: "Could not parse datafile"
+  defp validate_initial_datafile(datafile) do
+    if Featurevisor.Server.valid_datafile?(datafile), do: nil, else: "Could not parse datafile"
+  end
 
   defp resolve_as(provider, key, default, context, expected) do
     case datafile_error(provider.lifecycle) do
@@ -200,7 +206,10 @@ defmodule FeaturevisorOpenFeature.Provider do
         {evaluation,
          normalize_variable(
            evaluation.variable_value,
-           get_in(evaluation.variable || %{}, ["type"])
+           if(evaluation.variable["compose"],
+             do: nil,
+             else: get_in(evaluation.variable || %{}, ["type"])
+           )
          )}
 
       is_nil(selector) ->
@@ -226,6 +235,7 @@ defmodule FeaturevisorOpenFeature.Provider do
   defp split_key(key, separator) do
     case String.split(key, separator, parts: 2) do
       [feature] -> {feature, nil}
+      [feature, ""] -> {feature, nil}
       [feature, selector] -> {feature, selector}
     end
   end
@@ -293,12 +303,12 @@ defmodule FeaturevisorOpenFeature.Provider do
 
   defp reason_for(reason)
        when reason in [
-              :required,
               :forced,
               :sticky,
               :rule,
               :variable_override_variation,
-              :variable_override_rule
+              :variable_override_rule,
+              :variable_composed
             ],
        do: :targeting_match
 
@@ -309,7 +319,7 @@ defmodule FeaturevisorOpenFeature.Provider do
               :disabled,
               :variation_disabled,
               :variable_disabled,
-              :required_features_unmet
+              :conditions_unmet
             ],
        do: :disabled
 

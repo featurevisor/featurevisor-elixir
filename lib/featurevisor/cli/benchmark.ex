@@ -3,14 +3,19 @@ defmodule Featurevisor.CLI.Benchmark do
   alias Featurevisor.CLI.Project
 
   def run(options) do
-    targets = if options.target == [], do: [nil], else: Enum.uniq(options.target)
+    with {:ok, selections} <- Project.evaluation_selections(options) do
+      run_selections(options, selections)
+    end
+  end
 
-    Enum.reduce_while(targets, :ok, fn target, :ok ->
+  defp run_selections(options, selections) do
+    Enum.reduce_while(selections, :ok, fn {set, target}, :ok ->
       case Project.build(
              options.project_directory_path,
              options.environment,
              target,
-             options.inflate
+             options.inflate,
+             set
            ) do
         {:ok, datafile} ->
           f = Featurevisor.create_featurevisor(%{datafile: datafile, log_level: :fatal})
@@ -28,6 +33,7 @@ defmodule Featurevisor.CLI.Benchmark do
           if is_nil(options.feature), do: IO.puts("Variable: #{options.variable}")
           IO.puts("Environment: #{options.environment || false}")
           if target, do: IO.puts("Target: #{target}")
+          if set, do: IO.puts("Set: #{set}")
           IO.puts("Iterations: #{options.n}")
           IO.puts("Context: #{Jason.encode!(context)}")
           IO.puts("Evaluated value: #{Jason.encode!(value)}")
